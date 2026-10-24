@@ -11,8 +11,8 @@ The [format](format-v2.md) fixes cryptographic primitives, key separation and
 resource bounds. Callers cannot supply nonces or custom factor combiners.
 The complete envelope is authenticated before returning an unlocked key.
 Successful opening verifies every payload frame, order and completion before
-releasing plaintext. Method updates authenticate the header without checking
-the copied payload again.
+releasing plaintext. Method updates preserve payload ciphertext and verify the
+complete result before publication.
 
 Security-key results require verified signatures, credential identity and exact
 presence/UV flags. There is no method fallback, PIN retry or UV downgrade.

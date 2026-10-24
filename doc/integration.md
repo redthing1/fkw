@@ -75,7 +75,7 @@ retired in either order. Keep the old envelope until finished.
 | `open_to` | Verify into a private disk spool, then copy to a writer |
 | `inspect_bytes` / `inspect_file` | Read unverified metadata without interaction |
 | `verify_file` | Verify a complete container with an unlocked key |
-| `update_file` | Authenticate the old header and copy payload ciphertext unchanged; does not re-verify the payload |
+| `update_file` | Replace the access header, preserve payload ciphertext, and verify the complete result before publication |
 | `rotate_file` | Re-encrypt using a fresh key from `create`; reuse of the old key is rejected |
 
 File outputs sync and publish without overwriting destinations. Writer failures

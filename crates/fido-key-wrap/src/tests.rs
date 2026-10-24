@@ -583,7 +583,7 @@ fn payload_offset(bytes: &[u8]) -> usize {
     9 + u32::from_be_bytes(bytes[5..9].try_into().unwrap()) as usize
 }
 #[test]
-fn file_corruption_never_publishes_plaintext_or_writes_stdout() {
+fn corrupt_files_never_publish_plaintext_or_access_updates() {
     let (p, s, key) = recovery_key();
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("input");
@@ -614,12 +614,29 @@ fn file_corruption_never_publishes_plaintext_or_writes_stdout() {
         let mut stdout = Vec::new();
         assert!(seal::open_to(&p, &input, &mut stdout, id(&key), &mut &s).is_err());
         assert_eq!(stdout, [] as [u8; 0]);
+        assert!(seal::update_file(&key, &input, &output).is_err());
+        assert!(!output.exists());
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
     fs::write(&input, sealed).unwrap();
     fs::write(&output, b"existing").unwrap();
     assert!(seal::open_file(&p, &input, &output, id(&key), &mut &s).is_err());
     assert_eq!(fs::read(&output).unwrap(), b"existing");
+    #[cfg(unix)]
+    {
+        fs::remove_file(&output).unwrap();
+        std::os::unix::fs::symlink("missing", &output).unwrap();
+        // Refuse even a dangling destination before requesting any factor.
+        assert!(matches!(
+            seal::open_file(&p, &input, &output, id(&key), &mut ()),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            fs::read_link(&output).unwrap(),
+            std::path::Path::new("missing")
+        );
+        assert!(!directory.path().join("missing").exists());
+    }
 }
 #[test]
 fn method_updates_keep_payload_bytes_and_large_files_use_complete_operations() {

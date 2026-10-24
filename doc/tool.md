@@ -1,63 +1,75 @@
 # fkw
 
 ```sh
-cargo install --path crates/fkw-tool
-fkw seal --text -o note.fkw
-fkw open note.fkw
-fkw seal archive.tar -o archive.fkw --method key --uv --managed
-fkw open archive.fkw -o restored.tar
+cargo install --git https://github.com/redthing1/fido_key_wrap --locked
+fkw seal --text --armor -w passphrase
+fkw seal archive.tar -w key --uv
+fkw open archive.tar.fkw -o restored.tar
 ```
 
-Passphrases, PINs and `--text` use hidden terminal prompts. Omit the input path
-to seal piped stdin. Opening without `-o` writes to stdout after complete
-verification. Destinations are never overwritten. Original filenames and
-permissions are not preserved.
+`seal FILE` creates `FILE.fkw`. `open` requires an explicit destination and
+verifies the entire file before releasing plaintext. Existing files are never
+overwritten; originals are preserved. Use `fkw COMMAND --help` for all options.
 
-`--method` accepts `passphrase` (default), `key`, `keystore`, `key-passphrase`,
-`key-keystore`, or `recovery`. Key methods accept `--uv` and `--managed`;
-enrollment requires a configured PIN. Keystore methods accept
-`--store-access standard|user-authentication|macos-login`; see
-[platform support](platform-storage.md). `--kdf-memory` accepts 65536–262144 KiB,
-divisible by 16, for passphrase methods.
+| Option | Use |
+| --- | --- |
+| `-t`, `--text` | Enter a single hidden line; no secret argument |
+| Input `-` or omitted | Read piped stdin |
+| `-o FILE` | Write a new file |
+| `-c`, `--stdout` | Write to stdout; `-o -` also works |
+| `--armor` | Seal as printable text; defaults to stdout without an input filename |
 
-The default application identity is `io.fido-key-wrap.cli`. Use the same
-`--application` value when sealing and opening another namespace.
+Binary and armored files work with every reading command. Files use bounded
+memory; some operations need temporary disk space. New files are private on Unix.
+Original filenames and permissions are not stored. See [security](security.md).
 
-## Recovery and method changes
+Choose protection with `-w` / `--with`, or select interactively: `key`,
+`passphrase`, `key+passphrase`, `keystore`, `key+keystore`, or `recovery`.
+Passphrases and PINs use hidden prompts. Keys use touch by default; `--uv` requires
+user verification and `--managed` creates a discoverable credential. Enrollment
+requires a configured PIN. Keystore methods accept `--store-access`; see
+[platform support](platform-storage.md). Policies never fall back to weaker ones.
+
+## Access methods
 
 ```sh
 fkw recovery backup.key
-fkw methods add archive.fkw -o with-backup.fkw \
-  --method recovery --new-recovery-file backup.key --label backup
-fkw inspect with-backup.fkw
-fkw open with-backup.fkw --method-id METHOD_ID --recovery-file backup.key
-fkw methods remove with-backup.fkw -o updated.fkw \
-  --unlock BACKUP_ID --remove OLD_ID --recovery-file backup.key
+fkw access add archive.tar.fkw -o backed-up.fkw \
+  -w recovery -n backup --new-recovery-file backup.key
+fkw info backed-up.fkw
+fkw verify backed-up.fkw -u backup -r backup.key
+fkw open backed-up.fkw -u backup -r backup.key -o recovered.tar
+fkw access replace backed-up.fkw key -o replaced.fkw -w key --uv
+fkw access remove backed-up.fkw key -u backup -r backup.key -o updated.fkw
 ```
 
-Keep recovery files separate from encrypted data. They contain 32 random bytes;
-Unix reads require private permissions. `inspect` shows unverified metadata.
-Multiple methods require an exact ID: `--method-id` to open, `--unlock` to edit.
-`methods replace` takes `--remove OLD_ID` and the new method's enrollment options.
+Methods are alternative ways to unlock; combined recipes require both factors.
+`-n` / `--name` sets a unique public label. Adding defaults to the recipe name;
+replacing keeps the old label. `-u` / `--using` selects an exact label or unique
+ID prefix of at least four characters. A sole method is selected automatically;
+otherwise you choose interactively. `--no-input` disables terminal questions.
+`info` lists unverified metadata; `verify` authenticates the complete file.
 
-Edits write a new container with unchanged payload ciphertext. They authenticate
-the old header without rechecking the payload. Verify the saved result before
-deleting an old copy. If saving fails after enrollment, external factors may remain.
+Recovery files hold 32 random bytes. Keep them separate from sealed data; Unix
+reads require private permissions. `-r` supplies the unlocking secret, or the
+secret for a new recovery method. `--new-recovery-file` supplies a separate
+secret when adding or replacing a method.
 
-## Factor retirement
+Access edits verify the input and result, preserving payload ciphertext.
+Removal and replacement affect only the new copy. Older copies and external
+factors retain access; retirement and key rotation are library operations.
 
-Removing a method leaves its factors intact. Keep the old container and a saved
-updated container with that method removed:
+## Failed saves
+
+A save error identifies retained work and the available recovery option. Use a
+completed `sealed.fkw`, or retry with its `envelope` snapshot:
 
 ```sh
-fkw methods retire old.fkw --method-id OLD_ID \
-  --survivor updated.fkw --verify-with SURVIVOR_ID --factor credential
+fkw seal original.tar --resume work/envelope -o archive.fkw
+fkw access restore original.fkw --envelope work/envelope -o updated.fkw
 ```
 
-The command independently unlocks and fully verifies the survivor before deletion.
-`--factor credential` requires a managed credential; `--factor keystore` deletes
-the stored factor without needing the old security key. Combined factors may be
-retired in either order. Repeating keystore cleanup is harmless. Retirement also
-affects backups using that factor; a failure does not imply rollback.
-
-`fkw devices` reports native capabilities without creating credentials.
+Supply the snapshot's factors as usual. Retrying reuses enrollment. Keep the
+original input until saving succeeds, then delete the retained work directory.
+If snapshot persistence fails or enrollment is interrupted, an external factor
+may remain without a usable snapshot.

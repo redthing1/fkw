@@ -1,122 +1,280 @@
-use fido_key_wrap::seal;
+use fido_key_wrap::{ApplicationId, Enrollment, Method, Protector, RecoverySecret, seal};
 use std::{
-    ffi::OsStr,
     fs,
-    process::{Command, Output},
+    io::Write,
+    path::Path,
+    process::{Command, Output, Stdio},
 };
-fn run(dir: &std::path::Path, arguments: &[&str]) -> Output {
+
+fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fkw"))
         .current_dir(dir)
-        .args(arguments)
+        .arg("--no-input")
+        .args(args)
         .output()
         .unwrap()
 }
-fn ok(dir: &std::path::Path, arguments: &[&str]) -> Output {
-    let output = run(dir, arguments);
+fn success(output: Output) -> Output {
     assert!(
         output.status.success(),
-        "{:?}: {}",
-        arguments,
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     output
 }
-#[test]
-#[allow(clippy::too_many_lines)] // One persisted lifecycle, including its failure cases.
-fn complete_cli_recovery_and_method_lifecycle() {
+fn ok(dir: &Path, args: &[&str]) -> Output {
+    success(run(dir, args))
+}
+fn piped(dir: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkw"))
+        .current_dir(dir)
+        .arg("--no-input")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // Drain output concurrently: a pipe may be smaller than the test payload.
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            stdin.write_all(input).unwrap();
+        });
+        child.wait_with_output().unwrap()
+    })
+}
+fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    let plain = vec![0x5a; 100_001];
-    fs::write(path.join("input"), &plain).unwrap();
-    ok(path, &["recovery", "first.key"]);
-    assert_eq!(fs::read(path.join("first.key")).unwrap().len(), 32);
-    assert!(!run(path, &["recovery", "first.key"]).status.success());
+    fs::write(dir.path().join("input"), b"a private note\n").unwrap();
+    ok(dir.path(), &["recovery", "first.key"]);
     ok(
-        path,
+        dir.path(),
         &[
             "seal",
             "input",
-            "-o",
-            "sealed",
-            "--method",
+            "-w",
             "recovery",
-            "--recovery-file",
+            "-n",
+            "primary",
+            "-r",
             "first.key",
         ],
     );
-    let original = seal::inspect_file(path.join("sealed")).unwrap();
-    let first = original.methods().next().unwrap().id.to_string();
+    dir
+}
+fn private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[test]
+fn file_defaults_outputs_and_help() {
+    let dir = fixture();
+    let path = dir.path();
+    let plain = fs::read(path.join("input")).unwrap();
+    assert_eq!(fs::read(path.join("first.key")).unwrap().len(), 32);
+    private(&path.join("first.key"));
+    private(&path.join("input.fkw"));
+    let help = ok(path, &["--help"]);
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: fkw"));
+    assert!(String::from_utf8_lossy(&ok(path, &["--version"]).stdout).starts_with("fkw "));
+    let missing = run(path, &["open", "input.fkw", "-r", "first.key"]);
+    assert!(!missing.status.success());
+    assert_eq!(missing.stdout, b"");
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("choose an output"));
+    ok(
+        path,
+        &["open", "input.fkw", "-r", "first.key", "-o", "restored"],
+    );
+    assert_eq!(fs::read(path.join("restored")).unwrap(), plain);
+    private(&path.join("restored"));
     assert_eq!(
-        ok(path, &["open", "sealed", "--recovery-file", "first.key"]).stdout,
+        ok(path, &["open", "input.fkw", "-r", "first.key", "-c"]).stdout,
         plain
     );
-    let listed = ok(path, &["inspect", "sealed"]);
-    assert!(
-        String::from_utf8(listed.stdout)
-            .unwrap()
-            .contains("Unverified")
+    assert_eq!(
+        ok(path, &["verify", "input.fkw", "-r", "first.key"]).stdout,
+        b""
     );
+    let info = ok(path, &["info", "input.fkw"]);
+    let info = String::from_utf8(info.stdout).unwrap();
+    assert!(info.contains("Unverified") && info.contains("primary") && info.contains("recovery"));
+    for args in [
+        vec!["recovery", "first.key"],
+        vec!["seal", "input", "-w", "recovery", "-r", "first.key"],
+        vec!["open", "input.fkw", "-r", "first.key", "-o", "input"],
+    ] {
+        assert!(!run(path, &args).status.success());
+    }
+    assert_eq!(fs::read(path.join("input")).unwrap(), plain);
+}
+
+#[test]
+fn large_binary_and_armored_pipes_share_the_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    ok(path, &["recovery", "key"]);
+    let plain = vec![0xa5; 2 * 1024 * 1024 + 7];
+    for transport in [vec!["-c"], vec!["--armor"]] {
+        let mut args = vec!["seal", "-", "-w", "recovery", "-r", "key"];
+        args.extend(transport);
+        let sealed = success(piped(path, &args, &plain)).stdout;
+        let opened = success(piped(path, &["open", "-c", "-r", "key"], &sealed));
+        assert_eq!(opened.stdout, plain);
+        assert!(
+            success(piped(path, &["info"], &sealed))
+                .stdout
+                .starts_with(b"Unverified")
+        );
+        assert_eq!(
+            success(piped(path, &["verify", "-r", "key"], &sealed)).stdout,
+            b""
+        );
+        if sealed.starts_with(b"fkw:") {
+            let mut wrapped = b"fkw: \n".to_vec();
+            for chunk in sealed[4..].chunks(71) {
+                wrapped.extend_from_slice(chunk);
+                wrapped.extend_from_slice(b"\r\n \t");
+            }
+            fs::write(path.join("armored"), &wrapped).unwrap();
+            assert_eq!(
+                ok(path, &["open", "armored", "-c", "-r", "key"]).stdout,
+                plain
+            );
+            wrapped.extend_from_slice(b"!");
+            let bad = piped(path, &["open", "-c", "-r", "key"], &wrapped);
+            assert!(!bad.status.success());
+            assert_eq!(bad.stdout, b"");
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One persisted method lifecycle, including old copies and ciphertext.
+fn access_lifecycle_selects_labels_and_ids_and_preserves_payload() {
+    let dir = fixture();
+    let path = dir.path();
     ok(path, &["recovery", "second.key"]);
+    let original = seal::inspect_file(path.join("input.fkw")).unwrap();
+    let first = original.methods().next().unwrap().id.to_string();
     ok(
         path,
         &[
-            "methods",
+            "access",
             "add",
-            "sealed",
+            "input.fkw",
             "-o",
             "two",
-            "--method",
+            "-w",
             "recovery",
-            "--recovery-file",
+            "-n",
+            "backup",
+            "-r",
             "first.key",
             "--new-recovery-file",
             "second.key",
         ],
     );
-    assert!(
-        !run(path, &["open", "two", "--recovery-file", "first.key"])
-            .status
-            .success()
-    );
     let two = seal::inspect_file(path.join("two")).unwrap();
     let second = two
         .methods()
-        .find(|m| m.id.to_string() != first)
+        .find(|m| m.label == "backup")
         .unwrap()
         .id
         .to_string();
+    let original_bytes = fs::read(path.join("input.fkw")).unwrap();
+    let two_bytes = fs::read(path.join("two")).unwrap();
+    // The mutable header has a different length; the nonce and payload are identical.
+    assert_eq!(
+        &original_bytes[9 + original.to_bytes().len()..],
+        &two_bytes[9 + two.to_bytes().len()..]
+    );
+    let plain = fs::read(path.join("input")).unwrap();
+    assert!(
+        !run(path, &["open", "two", "-c", "-r", "first.key"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        ok(
+            path,
+            &["open", "two", "-c", "-u", "primary", "-r", "first.key"]
+        )
+        .stdout,
+        plain
+    );
+    assert_eq!(
+        ok(
+            path,
+            &["open", "two", "-c", "-u", &second[..8], "-r", "second.key"]
+        )
+        .stdout,
+        plain
+    );
+    let duplicate = run(
+        path,
+        &[
+            "access",
+            "add",
+            "two",
+            "-o",
+            "duplicate",
+            "-w",
+            "recovery",
+            "-n",
+            "backup",
+            "-u",
+            "primary",
+            "-r",
+            "first.key",
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("name already exists"));
     ok(
         path,
         &[
-            "methods",
+            "access",
             "remove",
             "two",
+            "primary",
             "-o",
             "one",
-            "--unlock",
-            &second,
-            "--remove",
-            &first,
-            "--recovery-file",
+            "-u",
+            "backup",
+            "-r",
             "second.key",
         ],
     );
     assert_eq!(
-        ok(path, &["open", "one", "--recovery-file", "second.key"]).stdout,
+        ok(path, &["open", "one", "-c", "-r", "second.key"]).stdout,
         plain
     );
     assert!(
         !run(
             path,
+            &["open", "one", "-c", "-u", &first, "-r", "first.key"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !run(
+            path,
             &[
-                "methods",
+                "access",
                 "remove",
                 "one",
+                "backup",
                 "-o",
                 "none",
-                "--remove",
-                &second,
-                "--recovery-file",
+                "-r",
                 "second.key"
             ]
         )
@@ -127,16 +285,15 @@ fn complete_cli_recovery_and_method_lifecycle() {
     ok(
         path,
         &[
-            "methods",
+            "access",
             "replace",
             "one",
+            "backup",
             "-o",
             "replaced",
-            "--remove",
-            &second,
-            "--method",
+            "-w",
             "recovery",
-            "--recovery-file",
+            "-r",
             "second.key",
             "--new-recovery-file",
             "first.key",
@@ -144,80 +301,239 @@ fn complete_cli_recovery_and_method_lifecycle() {
     );
     let replaced = seal::inspect_file(path.join("replaced")).unwrap();
     assert_eq!(replaced.methods().len(), 1);
+    assert_eq!(replaced.methods().next().unwrap().label, "backup");
     assert_ne!(replaced.methods().next().unwrap().id.to_string(), second);
     assert_eq!(
-        ok(path, &["open", "replaced", "--recovery-file", "first.key"]).stdout,
+        ok(path, &["open", "replaced", "-c", "-r", "first.key"]).stdout,
         plain
     );
-    assert!(
-        !run(
+    // Removing a route from the new file does not revoke older copies.
+    assert_eq!(
+        ok(
             path,
-            &[
-                "--application",
-                "other.example",
-                "open",
-                "sealed",
-                "--recovery-file",
-                "first.key"
-            ]
+            &["open", "two", "-c", "-u", "primary", "-r", "first.key"]
         )
-        .status
-        .success()
+        .stdout,
+        plain
     );
-    assert!(
-        !run(
-            path,
-            &[
-                "open",
-                "sealed",
+    assert_eq!(fs::read(path.join("input.fkw")).unwrap(), original_bytes);
+}
+
+#[test]
+fn damaged_files_release_no_plaintext_or_new_access() {
+    let dir = fixture();
+    let path = dir.path();
+    let sealed = fs::read(path.join("input.fkw")).unwrap();
+    let mut changed = sealed.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    let mut trailing = sealed.clone();
+    trailing.push(0);
+    for bytes in [changed, sealed[..sealed.len() - 1].to_vec(), trailing] {
+        fs::write(path.join("bad"), bytes).unwrap();
+        for args in [
+            vec!["open", "bad", "-c", "-r", "first.key"],
+            vec!["open", "bad", "-o", "plaintext", "-r", "first.key"],
+            vec!["verify", "bad", "-r", "first.key"],
+            // A passphrase prompt must not happen before full verification.
+            vec![
+                "access",
+                "add",
+                "bad",
                 "-o",
-                "input",
-                "--recovery-file",
-                "first.key"
-            ]
-        )
-        .status
-        .success()
-    );
-    assert_eq!(fs::read(path.join("input")).unwrap(), plain);
-    let mut corrupt = fs::read(path.join("sealed")).unwrap();
-    *corrupt.last_mut().unwrap() ^= 1;
-    fs::write(path.join("corrupt"), corrupt).unwrap();
-    let failed = run(path, &["open", "corrupt", "--recovery-file", "first.key"]);
-    assert!(!failed.status.success());
-    assert_eq!(failed.stdout, Vec::<u8>::new());
-    let failed = run(
+                "updated",
+                "-w",
+                "passphrase",
+                "-r",
+                "first.key",
+            ],
+        ] {
+            let result = run(path, &args);
+            assert!(!result.status.success());
+            assert_eq!(result.stdout, b"");
+            assert!(!String::from_utf8_lossy(&result.stderr).contains("Terminal input"));
+        }
+        assert!(!path.join("plaintext").exists());
+        assert!(!path.join("updated").exists());
+        assert!(!fs::read_dir(path).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fkw-")
+        }));
+    }
+}
+
+#[test]
+fn retained_snapshots_resume_without_reenrollment() {
+    let dir = fixture();
+    let path = dir.path();
+    let original = seal::inspect_file(path.join("input.fkw")).unwrap();
+    fs::write(path.join("envelope"), original.to_bytes()).unwrap();
+    ok(
         path,
         &[
-            "open",
-            "corrupt",
+            "seal",
+            "input",
             "-o",
-            "bad",
-            "--recovery-file",
+            "resumed",
+            "--resume",
+            "envelope",
+            "-r",
             "first.key",
         ],
     );
-    assert!(!failed.status.success());
-    assert!(!path.join("bad").exists());
-    assert!(
-        !fs::read_dir(path)
-            .unwrap()
-            .any(|entry| entry.unwrap().file_name().as_os_str() == OsStr::new("none"))
+    let resumed = seal::inspect_file(path.join("resumed")).unwrap();
+    assert_eq!(resumed.to_bytes(), original.to_bytes());
+    // Fresh stream material even though the enrollment is reused.
+    assert_ne!(
+        fs::read(path.join("resumed")).unwrap(),
+        fs::read(path.join("input.fkw")).unwrap()
     );
+    assert_eq!(
+        ok(path, &["open", "resumed", "-c", "-r", "first.key"]).stdout,
+        fs::read(path.join("input")).unwrap()
+    );
+    ok(
+        path,
+        &[
+            "access",
+            "add",
+            "input.fkw",
+            "-o",
+            "added",
+            "-w",
+            "recovery",
+            "-n",
+            "backup",
+            "-r",
+            "first.key",
+        ],
+    );
+    let added = seal::inspect_file(path.join("added")).unwrap();
+    fs::write(path.join("envelope"), added.to_bytes()).unwrap();
+    ok(
+        path,
+        &[
+            "access",
+            "restore",
+            "input.fkw",
+            "--envelope",
+            "envelope",
+            "-o",
+            "restored",
+            "-u",
+            "backup",
+            "-r",
+            "first.key",
+        ],
+    );
+    assert_eq!(
+        fs::read(path.join("restored")).unwrap(),
+        fs::read(path.join("added")).unwrap()
+    );
+    ok(
+        path,
+        &[
+            "seal",
+            "input",
+            "-o",
+            "unrelated",
+            "-w",
+            "recovery",
+            "-r",
+            "first.key",
+        ],
+    );
+    assert!(
+        !run(
+            path,
+            &[
+                "access",
+                "restore",
+                "unrelated",
+                "--envelope",
+                "envelope",
+                "-o",
+                "wrong",
+                "-u",
+                "backup",
+                "-r",
+                "first.key"
+            ]
+        )
+        .status
+        .success()
+    );
+    assert!(!path.join("wrong").exists());
 }
+
 #[test]
-fn invalid_recipe_options_fail_before_any_prompt() {
+fn invalid_options_and_untrusted_metadata_fail_without_prompts() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("input"), b"test").unwrap();
+    let path = dir.path();
+    fs::write(path.join("input"), b"test").unwrap();
     for options in [
-        ["--uv", "--method", "passphrase"],
-        ["--managed", "--method", "recovery"],
+        vec!["--uv", "-w", "passphrase"],
+        vec!["--managed", "-w", "recovery"],
+        vec!["--store-access", "standard", "-w", "recovery"],
+        vec!["-w", "recovery", "-n", ""],
+        vec!["--resume", "missing", "-w", "recovery"],
+        vec!["--text", "actual secret must not be an argument"],
     ] {
         let mut args = vec!["seal", "input", "-o", "output"];
         args.extend(options);
-        let result = run(dir.path(), &args);
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("require a key method"));
-        assert!(!dir.path().join("output").exists());
+        assert!(!run(path, &args).status.success());
+        assert!(!path.join("output").exists());
     }
+    let mut secret = RecoverySecret::generate().unwrap();
+    let foreign = Protector::new(ApplicationId::new("other.example").unwrap());
+    let key = foreign
+        .create(
+            &Enrollment::new(Method::RecoverySecret, "foreign").unwrap(),
+            &mut secret,
+        )
+        .unwrap();
+    seal::seal_file(&key, path.join("input"), path.join("foreign")).unwrap();
+    let result = run(path, &["open", "foreign", "-c"]);
+    assert!(!result.status.success());
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("supply --recovery-file"));
+    fs::write(path.join("oversized"), vec![0; 65_537]).unwrap();
+    assert!(
+        !run(
+            path,
+            &["seal", "input", "-o", "output", "--resume", "oversized"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_permissions_and_symlink_destinations_are_enforced() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = fixture();
+    let path = dir.path();
+    fs::set_permissions(path.join("first.key"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        !run(path, &["open", "input.fkw", "-c", "-r", "first.key"])
+            .status
+            .success()
+    );
+    fs::set_permissions(path.join("first.key"), fs::Permissions::from_mode(0o600)).unwrap();
+    for size in [31, 33] {
+        fs::write(path.join("first.key"), vec![0; size]).unwrap();
+        let output = run(path, &["open", "input.fkw", "-c", "-r", "first.key"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("exactly 32 bytes"));
+    }
+    symlink("missing", path.join("linked")).unwrap();
+    assert!(!run(path, &["recovery", "linked"]).status.success());
+    assert!(
+        !run(path, &["seal", "input", "-o", "linked", "-w", "recovery"])
+            .status
+            .success()
+    );
+    assert!(!path.join("missing").exists());
 }

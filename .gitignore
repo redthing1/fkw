@@ -9,6 +9,4 @@ __pycache__/
 /.idea/
 /.vscode/
 *.fkw
-*.fkd
-*.fkw-lock
-.fkw-*.tmp
+.fkw-*/

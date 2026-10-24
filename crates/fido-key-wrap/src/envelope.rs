@@ -48,6 +48,9 @@ pub struct MethodInfo<'a> {
     pub kdf_cost: Option<KdfCost>,
 }
 impl Envelope {
+    /// Maximum encoded size, for bounded reads before decoding.
+    pub const MAX_BYTES: usize = MAX_ENVELOPE_BYTES;
+
     #[must_use]
     pub const fn application_id(&self) -> &ApplicationId {
         &self.application

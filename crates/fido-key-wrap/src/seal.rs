@@ -8,7 +8,7 @@ use crate::{
 };
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::AeadInPlace};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -149,9 +149,9 @@ pub fn open_to(
     output.flush()?;
     Ok(())
 }
-/// Replaces only the access header and copies encrypted payload bytes unchanged.
-/// Authenticates the old envelope; does not re-verify payload integrity. Output
-/// must be a new path. Older copies retain their original unlock methods.
+/// Replaces the access header, preserving payload ciphertext. Verifies the
+/// complete staged container before publishing it to a new path.
+/// Older copies retain their original unlock methods.
 pub fn update_file(
     key: &UnlockedKey,
     input: impl AsRef<Path>,
@@ -164,6 +164,7 @@ pub fn update_file(
     let mut staged = staging_file(output)?;
     write_header(&key.envelope, &nonce, staged.as_file_mut())?;
     io::copy(&mut input, staged.as_file_mut())?;
+    verify_file(key, staged.path())?;
     publish(staged, output)
 }
 fn open_into_private(
@@ -178,10 +179,14 @@ fn open_into_private(
     decrypt(&key, &nonce, input, output, None)
 }
 fn staging_file(output: &Path) -> Result<NamedTempFile> {
-    if output.try_exists()? {
-        return Err(
-            io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists").into(),
-        );
+    match fs::symlink_metadata(output) {
+        Ok(_) => {
+            return Err(
+                io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists").into(),
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(NamedTempFile::new_in(parent(output))?)
 }
