@@ -63,19 +63,20 @@ impl fmt::Display for ApplicationId {
 
 /// stable public identity of one root-recovery route.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RecipientId(pub(crate) [u8; 32]);
+pub struct MethodId(pub(crate) [u8; 32]);
 
-impl RecipientId {
+impl MethodId {
     pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
-impl fmt::Display for RecipientId {
+impl fmt::Display for MethodId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
             write!(formatter, "{byte:02x}")?;
@@ -84,13 +85,13 @@ impl fmt::Display for RecipientId {
     }
 }
 
-impl fmt::Debug for RecipientId {
+impl fmt::Debug for MethodId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "RecipientId({self})")
+        write!(formatter, "MethodId({self})")
     }
 }
 
-impl FromStr for RecipientId {
+impl FromStr for MethodId {
     type Err = Error;
 
     fn from_str(value: &str) -> Result<Self> {
@@ -99,7 +100,7 @@ impl FromStr for RecipientId {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(Error::InvalidRecipientId);
+            return Err(Error::InvalidMethodId);
         }
         let mut bytes = [0u8; 32];
         for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
@@ -133,11 +134,11 @@ mod tests {
 
     #[test]
     fn recipient_id_uses_exact_lowercase_hex() {
-        let id = RecipientId([0xabu8; 32]);
+        let id = MethodId([0xabu8; 32]);
         let text = id.to_string();
         assert_eq!(text.len(), 64);
-        assert_eq!(text.parse::<RecipientId>().unwrap(), id);
-        assert!(text.to_uppercase().parse::<RecipientId>().is_err());
-        assert!(text[..63].parse::<RecipientId>().is_err());
+        assert_eq!(text.parse::<MethodId>().unwrap(), id);
+        assert!(text.to_uppercase().parse::<MethodId>().is_err());
+        assert!(text[..63].parse::<MethodId>().is_err());
     }
 }

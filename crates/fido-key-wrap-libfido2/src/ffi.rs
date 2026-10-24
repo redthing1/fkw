@@ -428,7 +428,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn candidates_use_only_the_versioned_abi() {
-        assert!(!library_candidates().is_empty());
+        assert_ne!(library_candidates(), &[] as &[&str]);
         assert!(library_candidates().iter().all(|candidate| {
             candidate.ends_with("libfido2.so.1") || candidate.ends_with("libfido2.1.dylib")
         }));

@@ -1,5 +1,5 @@
+use crate::{EntryId, Secret};
 use core_foundation::{base::ToVoid, data::CFData, dictionary::CFMutableDictionary};
-use fido_key_wrap::{RecipientId, RecoverySecret};
 use security_framework::{
     access_control::{ProtectionMode, SecAccessControl},
     base::Error as NativeError,
@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    MacosUserPresenceStore, Removal, Result, StoreError, import_recovery_secret, recipient_name,
-    recovery_secret_matches, recovery_service_name,
+    AuthenticatedStore, Removal, Result, StoreError, authenticated_service_name, binary_matches,
+    import_binary, recipient_name,
 };
 
-const LABEL_PREFIX: &str = "fido key wrap recovery secret ";
+const LABEL_PREFIX: &str = "fido key wrap authenticated factor ";
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_NOT_AVAILABLE: i32 = -25_291;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25_308;
@@ -32,9 +32,9 @@ const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34_018;
 const ERR_SEC_SERVICE_NOT_AVAILABLE: i32 = -67_585;
 
 pub(crate) fn create(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    secret: &Secret,
 ) -> Result<()> {
     match add(store, recipient, secret) {
         Ok(()) => verify_created(store, recipient, secret)
@@ -47,14 +47,11 @@ pub(crate) fn create(
     }
 }
 
-pub(crate) fn load(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-) -> Result<RecoverySecret> {
+pub(crate) fn load(store: &AuthenticatedStore, recipient: EntryId) -> Result<Secret> {
     load_exact(store, recipient)
 }
 
-fn load_exact(store: &MacosUserPresenceStore, recipient: RecipientId) -> Result<RecoverySecret> {
+fn load_exact(store: &AuthenticatedStore, recipient: EntryId) -> Result<Secret> {
     match inventory_count(store, recipient)? {
         0 => return Err(StoreError::Missing),
         1 => {}
@@ -64,7 +61,7 @@ fn load_exact(store: &MacosUserPresenceStore, recipient: RecipientId) -> Result<
     let mut values = find_values(store, recipient)?;
     let secret = match values.len() {
         0 => return Err(StoreError::Missing),
-        1 => import_recovery_secret(&values.pop().expect("one exact value"))?,
+        1 => import_binary(&values.pop().expect("one exact value"))?,
         _ => return Err(StoreError::Ambiguous),
     };
     match fingerprint_count(store, recipient, &secret)? {
@@ -75,9 +72,9 @@ fn load_exact(store: &MacosUserPresenceStore, recipient: RecipientId) -> Result<
 }
 
 pub(crate) fn remove(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    expected: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    expected: &Secret,
 ) -> Result<Removal> {
     match inventory_count(store, recipient)? {
         0 => return Ok(Removal::Absent),
@@ -95,11 +92,11 @@ pub(crate) fn remove(
 }
 
 fn add(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    secret: &Secret,
 ) -> security_framework::base::Result<()> {
-    let service = recovery_service_name(store.application_id());
+    let service = authenticated_service_name(store.application_id());
     let account = recipient_name(recipient);
     let label = item_label(secret);
     let access_control = SecAccessControl::create_with_protection(
@@ -135,11 +132,7 @@ fn add(
     })
 }
 
-fn verify_created(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
-) -> Result<()> {
+fn verify_created(store: &AuthenticatedStore, recipient: EntryId, secret: &Secret) -> Result<()> {
     let stored = load_exact(store, recipient)?;
     if secrets_match(&stored, secret) {
         Ok(())
@@ -148,11 +141,7 @@ fn verify_created(
     }
 }
 
-fn compare_existing(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
-) -> Result<()> {
+fn compare_existing(store: &AuthenticatedStore, recipient: EntryId, secret: &Secret) -> Result<()> {
     let stored = load_exact(store, recipient)?;
     if secrets_match(&stored, secret) {
         Ok(())
@@ -162,9 +151,9 @@ fn compare_existing(
 }
 
 fn reconcile_after_add_error(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    secret: &Secret,
     native_error: NativeError,
 ) -> Result<()> {
     match inventory_count(store, recipient) {
@@ -183,9 +172,9 @@ fn reconcile_after_add_error(
 }
 
 fn cleanup_after_failed_create(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    secret: &Secret,
     original_error: StoreError,
 ) -> Result<()> {
     let _ = deletion_query(store, recipient, secret).delete();
@@ -196,8 +185,8 @@ fn cleanup_after_failed_create(
 }
 
 fn reconcile_after_delete_error(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
     native_error: NativeError,
 ) -> Result<Removal> {
     match inventory_count(store, recipient) {
@@ -208,17 +197,14 @@ fn reconcile_after_delete_error(
     }
 }
 
-fn confirm_removed(store: &MacosUserPresenceStore, recipient: RecipientId) -> Result<Removal> {
+fn confirm_removed(store: &AuthenticatedStore, recipient: EntryId) -> Result<Removal> {
     match inventory_count(store, recipient) {
         Ok(0) => Ok(Removal::Removed),
         Ok(_) | Err(_) => Err(StoreError::StateUncertain),
     }
 }
 
-fn find_values(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-) -> Result<Vec<Zeroizing<Vec<u8>>>> {
+fn find_values(store: &AuthenticatedStore, recipient: EntryId) -> Result<Vec<Zeroizing<Vec<u8>>>> {
     let mut query = exact_query(store, recipient);
     query.load_data(true);
     let results = match query.search() {
@@ -235,7 +221,7 @@ fn find_values(
         .collect()
 }
 
-fn inventory_count(store: &MacosUserPresenceStore, recipient: RecipientId) -> Result<usize> {
+fn inventory_count(store: &AuthenticatedStore, recipient: EntryId) -> Result<usize> {
     let mut query = exact_query(store, recipient);
     query.load_attributes(true);
     match query.search() {
@@ -253,9 +239,9 @@ fn inventory_count(store: &MacosUserPresenceStore, recipient: RecipientId) -> Re
 }
 
 fn fingerprint_count(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    secret: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    secret: &Secret,
 ) -> Result<usize> {
     let mut query = deletion_query(store, recipient, secret);
     query.limit(Limit::All).load_attributes(true);
@@ -273,17 +259,17 @@ fn fingerprint_count(
     }
 }
 
-fn exact_query(store: &MacosUserPresenceStore, recipient: RecipientId) -> ItemSearchOptions {
+fn exact_query(store: &AuthenticatedStore, recipient: EntryId) -> ItemSearchOptions {
     let mut query = base_query(store, recipient);
     query.limit(Limit::All);
     query
 }
 
-fn base_query(store: &MacosUserPresenceStore, recipient: RecipientId) -> ItemSearchOptions {
+fn base_query(store: &AuthenticatedStore, recipient: EntryId) -> ItemSearchOptions {
     let mut query = ItemSearchOptions::new();
     query
         .class(ItemClass::generic_password())
-        .service(&recovery_service_name(store.application_id()))
+        .service(&authenticated_service_name(store.application_id()))
         .account(&recipient_name(recipient))
         .cloud_sync(CloudSync::MatchSyncNo)
         .ignore_legacy_keychains();
@@ -291,18 +277,18 @@ fn base_query(store: &MacosUserPresenceStore, recipient: RecipientId) -> ItemSea
 }
 
 fn deletion_query(
-    store: &MacosUserPresenceStore,
-    recipient: RecipientId,
-    expected: &RecoverySecret,
+    store: &AuthenticatedStore,
+    recipient: EntryId,
+    expected: &Secret,
 ) -> ItemSearchOptions {
     let mut query = base_query(store, recipient);
     query.label(&item_label(expected));
     query
 }
 
-// RecoverySecret is uniformly random with 256 bits of entropy. Its digest is
+// Secret is uniformly random with 256 bits of entropy. Its digest is
 // public item identity, not a verifier for passwords or other guessable input.
-fn item_label(secret: &RecoverySecret) -> String {
+fn item_label(secret: &Secret) -> String {
     secret.expose(|bytes| {
         use std::fmt::Write;
 
@@ -315,8 +301,8 @@ fn item_label(secret: &RecoverySecret) -> String {
     })
 }
 
-fn secrets_match(actual: &RecoverySecret, expected: &RecoverySecret) -> bool {
-    actual.expose(|bytes| recovery_secret_matches(bytes, expected))
+fn secrets_match(actual: &Secret, expected: &Secret) -> bool {
+    actual.expose(|bytes| binary_matches(bytes, expected))
 }
 
 fn is_definite_add_failure(error: NativeError) -> bool {
@@ -381,10 +367,10 @@ mod tests {
     #[test]
     fn item_identity_contains_only_a_public_secret_fingerprint() {
         let mut bytes = [7u8; 32];
-        let secret = RecoverySecret::import(&mut bytes);
+        let secret = Secret::import(&mut bytes);
         assert_eq!(
             item_label(&secret),
-            "fido key wrap recovery secret \
+            "fido key wrap authenticated factor \
              4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0"
         );
     }

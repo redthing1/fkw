@@ -5,11 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[features]
-testing = []
-
 [dependencies]
 aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+tempfile.workspace = true
+fido-key-wrap-platform = { path = "../fido-key-wrap-platform" }
 # enable aes round-key cleanup and ghash construction-temporary cleanup.
 aes.workspace = true
 ghash.workspace = true
@@ -24,6 +24,9 @@ sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+fido-key-wrap-platform = { path = "../fido-key-wrap-platform", features = ["testing"] }
 
 [lints]
 workspace = true

@@ -171,7 +171,10 @@ impl Default for Config {
 }
 
 fn validate_milliseconds(duration: Duration, message: &'static str) -> Result<()> {
-    if duration.as_millis() < 1 || duration.as_millis() > i32::MAX as u128 {
+    if duration.as_millis() < 1
+        || duration.as_millis() > i32::MAX as u128
+        || duration.subsec_nanos() % 1_000_000 != 0
+    {
         return Err(Error::InvalidInput(message));
     }
     Ok(())
@@ -193,7 +196,7 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// whether this device satisfies the backend's common format-1 requirements.
+    /// whether this device satisfies the backend's common credential requirements.
     #[must_use]
     pub fn compatible(&self) -> bool {
         self.fido2
@@ -2759,6 +2762,7 @@ mod tests {
     fn configuration_is_finite_and_bounded() {
         assert!(Config::new(Duration::ZERO, Duration::from_secs(1), 1).is_err());
         assert!(Config::new(Duration::from_nanos(1), Duration::from_secs(1), 1).is_err());
+        assert!(Config::new(Duration::from_micros(1001), Duration::from_secs(1), 1).is_err());
         assert!(Config::new(Duration::from_secs(1), Duration::from_secs(1), 0).is_err());
         assert!(Config::new(Duration::from_secs(1), Duration::from_secs(1), 33).is_err());
         assert!(Config::new(Duration::from_secs(1), Duration::from_secs(1), 32).is_ok());
@@ -2790,7 +2794,7 @@ mod tests {
     #[test]
     fn empty_native_string_array_may_have_a_null_pointer() {
         let values = unsafe { copy_string_array(ptr::null_mut(), 0) }.unwrap();
-        assert!(values.is_empty());
+        assert_eq!(values, Vec::<String>::new());
     }
 
     #[test]

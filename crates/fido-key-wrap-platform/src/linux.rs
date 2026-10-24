@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 
-use fido_key_wrap::{LocalSecret, RecipientId};
+use crate::{EntryId, Secret};
 use secret_service::{EncryptionType, blocking::SecretService};
 use zeroize::Zeroizing;
 
 use crate::{
-    NativeLocalSecretStore, Removal, Result, StoreError, binary_matches, import_binary,
-    recipient_name,
+    Removal, Result, StandardStore, StoreError, binary_matches, import_binary, recipient_name,
 };
 
 const LABEL: &str = "fido key wrap local secret";
-const SCHEMA: &str = "org.fido-key-wrap.local-secret";
+const SCHEMA: &str = "org.fido-key-wrap.v2.factor";
 
 struct EntryKey<'a> {
     application: &'a str,
@@ -27,11 +26,7 @@ impl EntryKey<'_> {
     }
 }
 
-pub(crate) fn create(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    secret: &LocalSecret,
-) -> Result<()> {
+pub(crate) fn create(store: &StandardStore, recipient: EntryId, secret: &Secret) -> Result<()> {
     let service = connect()?;
     let collection = default_collection(&service)?;
     unlock_collection(&collection)?;
@@ -90,7 +85,7 @@ pub(crate) fn create(
     cleanup_after_failed_create(&collection, &key, &created, StoreError::Ambiguous)
 }
 
-pub(crate) fn load(store: &NativeLocalSecretStore, recipient: RecipientId) -> Result<LocalSecret> {
+pub(crate) fn load(store: &StandardStore, recipient: EntryId) -> Result<Secret> {
     let service = connect()?;
     let collection = default_collection(&service)?;
     unlock_collection(&collection)?;
@@ -108,7 +103,7 @@ pub(crate) fn load(store: &NativeLocalSecretStore, recipient: RecipientId) -> Re
     }
 }
 
-pub(crate) fn remove(store: &NativeLocalSecretStore, recipient: RecipientId) -> Result<Removal> {
+pub(crate) fn remove(store: &StandardStore, recipient: EntryId) -> Result<Removal> {
     let service = connect()?;
     let collection = default_collection(&service)?;
     unlock_collection(&collection)?;
@@ -145,7 +140,7 @@ pub(crate) fn remove(store: &NativeLocalSecretStore, recipient: RecipientId) -> 
 fn reconcile_after_create_error(
     collection: &secret_service::blocking::Collection<'_>,
     key: &EntryKey<'_>,
-    secret: &LocalSecret,
+    secret: &Secret,
     native_error: secret_service::Error,
 ) -> Result<()> {
     let items = collection
@@ -184,9 +179,9 @@ fn unlock_collection(collection: &secret_service::blocking::Collection<'_>) -> R
     collection.ensure_unlocked().map_err(map_error)
 }
 
-fn entry_key(store: &NativeLocalSecretStore, recipient: RecipientId) -> EntryKey<'_> {
+fn entry_key(store: &StandardStore, recipient: EntryId) -> EntryKey<'_> {
     EntryKey {
-        application: store.application_id().as_str(),
+        application: store.application_id(),
         recipient: recipient_name(recipient),
     }
 }
@@ -216,7 +211,7 @@ fn map_error(error: secret_service::Error) -> StoreError {
             StoreError::Unavailable
         }
         secret_service::Error::Zbus(error) => map_zbus_error(error),
-        secret_service::Error::ZbusFdo(error) => map_fdo_error(error),
+        secret_service::Error::ZbusFdo(error) => map_fdo_error(&error),
         secret_service::Error::Crypto(_) | secret_service::Error::Zvariant(_) => {
             StoreError::OperationFailed
         }
@@ -230,12 +225,12 @@ fn map_zbus_error(error: zbus::Error) -> StoreError {
         zbus::Error::Address(_) | zbus::Error::Handshake(_) | zbus::Error::InputOutput(_) => {
             StoreError::Unavailable
         }
-        zbus::Error::FDO(error) => map_fdo_error(*error),
+        zbus::Error::FDO(error) => map_fdo_error(&error),
         _ => StoreError::OperationFailed,
     }
 }
 
-fn map_fdo_error(error: zbus::fdo::Error) -> StoreError {
+fn map_fdo_error(error: &zbus::fdo::Error) -> StoreError {
     use zbus::fdo::Error as FdoError;
 
     match error {
@@ -291,15 +286,15 @@ mod tests {
         }
 
         assert_eq!(
-            map_fdo_error(zbus::fdo::Error::AccessDenied(String::new())),
+            map_fdo_error(&zbus::fdo::Error::AccessDenied(String::new())),
             StoreError::AccessDenied
         );
         assert_eq!(
-            map_fdo_error(zbus::fdo::Error::NotSupported(String::new())),
+            map_fdo_error(&zbus::fdo::Error::NotSupported(String::new())),
             StoreError::Unsupported
         );
         assert_eq!(
-            map_fdo_error(zbus::fdo::Error::ServiceUnknown(String::new())),
+            map_fdo_error(&zbus::fdo::Error::ServiceUnknown(String::new())),
             StoreError::Unavailable
         );
     }

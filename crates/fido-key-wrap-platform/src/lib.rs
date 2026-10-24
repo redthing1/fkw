@@ -1,12 +1,6 @@
-//! store typed application factors in native user secret stores.
-//!
-//! this companion crate keeps platform i/o separate from the cryptographic
-//! core. applications still publish envelopes and remove recipients in their
-//! own durable transaction.
-
-#![warn(missing_docs)]
-#![allow(clippy::missing_errors_doc)]
-
+//! Native storage of random factors; independent of envelope policy.
+#![forbid(unsafe_code)]
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 mod error;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -18,248 +12,260 @@ mod macos_user_presence;
 pub mod testing;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
-
-use fido_key_wrap::{ApplicationId, LocalSecret, RecipientId, RecoverySecret};
-use subtle::ConstantTimeEq;
-
 pub use error::{Result, StoreError};
-
+use std::fmt;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 const SECRET_BYTES: usize = 32;
 
-/// confirmed result of an idempotent removal.
+/// Exact native access requirement. Unsupported requirements fail closed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Access {
+    /// Linux Secret Service or macOS data-protection keychain.
+    Standard,
+    /// OS-enforced local user authentication (macOS only).
+    UserAuthentication,
+    /// Explicit macOS login keychain for unsigned command-line programs.
+    MacosLogin,
+}
+/// Random store factor, erased on drop and redacted in debug output.
+pub struct Secret(Zeroizing<[u8; 32]>);
+impl Secret {
+    /// Copies a factor into zeroizing storage and erases the source.
+    pub fn import(bytes: &mut [u8; 32]) -> Self {
+        let secret = Self(Zeroizing::new(*bytes));
+        bytes.zeroize();
+        secret
+    }
+    /// Temporarily exposes the factor to a trusted adapter.
+    pub fn expose<T>(&self, f: impl FnOnce(&[u8; 32]) -> T) -> T {
+        f(&self.0)
+    }
+}
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret([REDACTED])")
+    }
+}
+/// Confirmed result of deletion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Removal {
-    /// the exact entry was deleted and is now absent.
     Removed,
-    /// the exact entry was already absent.
     Absent,
 }
-
-/// exact storage operations for paired-machine local factors.
-pub trait LocalSecretStore: Send + Sync {
-    /// creates the exact entry without replacing different material.
-    ///
-    /// retrying with the same recipient and secret is successful.
-    fn create(&self, recipient: RecipientId, secret: &LocalSecret) -> Result<()>;
-
-    /// loads one exact local secret.
-    fn load(&self, recipient: RecipientId) -> Result<LocalSecret>;
-
-    /// removes one exact entry and confirms that it is absent.
-    fn remove(&self, recipient: RecipientId) -> Result<Removal>;
+/// Trusted adapter. Creation never overwrites different material and confirms
+/// an exact read-back. Loads reject ambiguity. Removal matches the expected
+/// factor and confirms absence. Report uncertain effects as `StateUncertain`.
+/// Enforce `access` exactly. Application namespaces are trusted configuration.
+pub trait Keystore: Send + Sync {
+    /// Rejects unsupported access before an operation prompts for other factors.
+    /// Actual store availability can still fail during I/O.
+    fn check_access(&self, _access: Access) -> Result<()> {
+        Ok(())
+    }
+    fn create(
+        &self,
+        application: &str,
+        id: &[u8; 32],
+        access: Access,
+        secret: &Secret,
+    ) -> Result<()>;
+    fn load(&self, application: &str, id: &[u8; 32], access: Access) -> Result<Secret>;
+    fn remove(
+        &self,
+        application: &str,
+        id: &[u8; 32],
+        access: Access,
+        expected: &Secret,
+    ) -> Result<Removal>;
 }
-
-/// exact storage operations for generated recovery secrets.
-///
-/// implementations protect only uniformly random [`RecoverySecret`] values;
-/// root keys, passphrases, and arbitrary application secrets are outside this
-/// boundary.
-pub trait RecoverySecretStore: Send + Sync {
-    /// creates the exact entry without replacing different material.
-    ///
-    /// retrying with the same recipient and secret is successful.
-    fn create(&self, recipient: RecipientId, secret: &RecoverySecret) -> Result<()>;
-
-    /// loads one exact recovery secret.
-    fn load(&self, recipient: RecipientId) -> Result<RecoverySecret>;
-
-    /// removes one exact entry containing the expected secret and confirms
-    /// that it is absent.
-    ///
-    /// callers normally pass the value returned by [`Self::load`] after using
-    /// it to authenticate the selected envelope.
-    fn remove(&self, recipient: RecipientId, expected: &RecoverySecret) -> Result<Removal>;
+impl<T: Keystore + ?Sized> Keystore for std::sync::Arc<T> {
+    fn check_access(&self, access: Access) -> Result<()> {
+        (**self).check_access(access)
+    }
+    fn create(&self, app: &str, id: &[u8; 32], access: Access, secret: &Secret) -> Result<()> {
+        (**self).create(app, id, access, secret)
+    }
+    fn load(&self, app: &str, id: &[u8; 32], access: Access) -> Result<Secret> {
+        (**self).load(app, id, access)
+    }
+    fn remove(
+        &self,
+        app: &str,
+        id: &[u8; 32],
+        access: Access,
+        expected: &Secret,
+    ) -> Result<Removal> {
+        (**self).remove(app, id, access, expected)
+    }
 }
-
-/// native local-secret storage bound to one trusted application identity.
-#[derive(Debug)]
-pub struct NativeLocalSecretStore {
-    application: ApplicationId,
+/// Stateless native dispatcher; construction performs no native I/O.
+#[derive(Debug, Default)]
+pub struct NativeStore;
+impl Keystore for NativeStore {
+    fn check_access(&self, access: Access) -> Result<()> {
+        let supported = match access {
+            Access::Standard => cfg!(any(target_os = "linux", target_os = "macos")),
+            Access::UserAuthentication | Access::MacosLogin => cfg!(target_os = "macos"),
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(StoreError::Unsupported)
+        }
+    }
+    fn create(&self, app: &str, id: &[u8; 32], access: Access, secret: &Secret) -> Result<()> {
+        if access == Access::UserAuthentication {
+            #[cfg(target_os = "macos")]
+            return macos_user_presence::create(
+                &AuthenticatedStore::new(app),
+                EntryId(*id),
+                secret,
+            );
+            #[cfg(not(target_os = "macos"))]
+            return Err(StoreError::Unsupported);
+        }
+        platform_create(&StandardStore::new(app, access)?, EntryId(*id), secret)
+    }
+    fn load(&self, app: &str, id: &[u8; 32], access: Access) -> Result<Secret> {
+        if access == Access::UserAuthentication {
+            #[cfg(target_os = "macos")]
+            return macos_user_presence::load(&AuthenticatedStore::new(app), EntryId(*id));
+            #[cfg(not(target_os = "macos"))]
+            return Err(StoreError::Unsupported);
+        }
+        platform_load(&StandardStore::new(app, access)?, EntryId(*id))
+    }
+    fn remove(
+        &self,
+        app: &str,
+        id: &[u8; 32],
+        access: Access,
+        expected: &Secret,
+    ) -> Result<Removal> {
+        if access == Access::UserAuthentication {
+            #[cfg(target_os = "macos")]
+            return macos_user_presence::remove(
+                &AuthenticatedStore::new(app),
+                EntryId(*id),
+                expected,
+            );
+            #[cfg(not(target_os = "macos"))]
+            return Err(StoreError::Unsupported);
+        }
+        let store = StandardStore::new(app, access)?;
+        let current = match platform_load(&store, EntryId(*id)) {
+            Ok(value) => value,
+            Err(StoreError::Missing) => return Ok(Removal::Absent),
+            Err(error) => return Err(error),
+        };
+        if !current.expose(|a| expected.expose(|b| bool::from(a.ct_eq(b)))) {
+            return Err(StoreError::AlreadyExists);
+        }
+        platform_remove(&store, EntryId(*id))
+    }
+}
+// Vocabulary private to retained native adapters.
+#[derive(Clone, Copy)]
+struct EntryId([u8; 32]);
+impl fmt::Display for EntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+struct StandardStore {
+    application: String,
     #[cfg(target_os = "macos")]
     kind: macos::StoreKind,
 }
-
-impl NativeLocalSecretStore {
-    /// uses the native user secret store for the current session.
-    ///
-    /// on macos this selects the non-synchronizing data-protection keychain and
-    /// requires an appropriately signed application. on linux this selects the
-    /// default Secret Service collection.
-    #[must_use]
-    pub const fn new(application: ApplicationId) -> Self {
-        Self {
-            application,
+impl StandardStore {
+    fn new(app: &str, access: Access) -> Result<Self> {
+        #[cfg(not(target_os = "macos"))]
+        if access != Access::Standard {
+            return Err(StoreError::Unsupported);
+        }
+        Ok(Self {
+            application: app.to_owned(),
             #[cfg(target_os = "macos")]
-            kind: macos::StoreKind::DataProtection,
-        }
+            kind: match access {
+                Access::Standard => macos::StoreKind::DataProtection,
+                Access::MacosLogin => macos::StoreKind::LoginKeychain,
+                Access::UserAuthentication => return Err(StoreError::Unsupported),
+            },
+        })
     }
-
-    /// uses the default macos login keychain for an unsigned command-line program.
-    ///
-    /// this backend has the login keychain's access-control and backup behavior;
-    /// it is never selected as a fallback from the data-protection keychain.
-    #[cfg(target_os = "macos")]
-    #[must_use]
-    pub const fn macos_login_keychain(application: ApplicationId) -> Self {
+    fn application_id(&self) -> &str {
+        &self.application
+    }
+}
+#[cfg(target_os = "macos")]
+struct AuthenticatedStore {
+    application: String,
+}
+#[cfg(target_os = "macos")]
+impl AuthenticatedStore {
+    fn new(app: &str) -> Self {
         Self {
-            application,
-            kind: macos::StoreKind::LoginKeychain,
+            application: app.to_owned(),
         }
     }
-
-    /// returns the trusted application identity used for every entry.
-    #[must_use]
-    pub const fn application_id(&self) -> &ApplicationId {
+    fn application_id(&self) -> &str {
         &self.application
     }
 }
-
-impl LocalSecretStore for NativeLocalSecretStore {
-    fn create(&self, recipient: RecipientId, secret: &LocalSecret) -> Result<()> {
-        platform_create(self, recipient, secret)
-    }
-
-    fn load(&self, recipient: RecipientId) -> Result<LocalSecret> {
-        platform_load(self, recipient)
-    }
-
-    fn remove(&self, recipient: RecipientId) -> Result<Removal> {
-        platform_remove(self, recipient)
-    }
-}
-
-/// recovery-secret storage protected by macos user presence.
-///
-/// each load requires local user authentication accepted by macos. entries use
-/// the non-synchronizing data-protection keychain and never fall back to a file
-/// keychain.
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-pub struct MacosUserPresenceStore {
-    application: ApplicationId,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosUserPresenceStore {
-    /// creates a store for one trusted application identity.
-    #[must_use]
-    pub const fn new(application: ApplicationId) -> Self {
-        Self { application }
-    }
-
-    /// returns the trusted application identity used for every entry.
-    #[must_use]
-    pub const fn application_id(&self) -> &ApplicationId {
-        &self.application
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl RecoverySecretStore for MacosUserPresenceStore {
-    fn create(&self, recipient: RecipientId, secret: &RecoverySecret) -> Result<()> {
-        macos_user_presence::create(self, recipient, secret)
-    }
-
-    fn load(&self, recipient: RecipientId) -> Result<RecoverySecret> {
-        macos_user_presence::load(self, recipient)
-    }
-
-    fn remove(&self, recipient: RecipientId, expected: &RecoverySecret) -> Result<Removal> {
-        macos_user_presence::remove(self, recipient, expected)
-    }
-}
-
 #[cfg(target_os = "linux")]
 use linux::{create as platform_create, load as platform_load, remove as platform_remove};
 #[cfg(target_os = "macos")]
 use macos::{create as platform_create, load as platform_load, remove as platform_remove};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use unsupported::{create as platform_create, load as platform_load, remove as platform_remove};
-
-#[cfg(any(test, target_os = "macos"))]
-fn service_name(application: &ApplicationId) -> String {
-    format!("fido-key-wrap.local-secret:{}", application.as_str())
+#[cfg(target_os = "macos")]
+fn service_name(app: &str) -> String {
+    format!("fido-key-wrap.v2.factor:{app}")
 }
-
-#[cfg(any(test, target_os = "macos"))]
-fn recovery_service_name(application: &ApplicationId) -> String {
-    format!("fido-key-wrap.recovery-secret:{}", application.as_str())
+#[cfg(target_os = "macos")]
+fn authenticated_service_name(app: &str) -> String {
+    format!("fido-key-wrap.v2.authenticated-factor:{app}")
 }
-
-fn recipient_name(recipient: RecipientId) -> String {
-    recipient.to_string()
+fn recipient_name(id: EntryId) -> String {
+    id.to_string()
 }
-
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn import_binary(bytes: &[u8]) -> Result<LocalSecret> {
-    if bytes.len() != SECRET_BYTES {
-        return Err(StoreError::Corrupt);
-    }
-    let mut exact = [0u8; SECRET_BYTES];
-    exact.copy_from_slice(bytes);
-    Ok(LocalSecret::import(&mut exact))
+fn import_binary(bytes: &[u8]) -> Result<Secret> {
+    let mut exact: [u8; 32] = bytes.try_into().map_err(|_| StoreError::Corrupt)?;
+    Ok(Secret::import(&mut exact))
 }
-
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn binary_matches(bytes: &[u8], secret: &LocalSecret) -> bool {
-    bytes.len() == SECRET_BYTES
-        && secret.expose(|expected| bool::from(expected.as_slice().ct_eq(bytes)))
+fn binary_matches(bytes: &[u8], secret: &Secret) -> bool {
+    bytes.len() == 32 && secret.expose(|expected| bool::from(expected.as_slice().ct_eq(bytes)))
 }
-
-#[cfg(any(test, target_os = "macos"))]
-fn import_recovery_secret(bytes: &[u8]) -> Result<RecoverySecret> {
-    if bytes.len() != SECRET_BYTES {
-        return Err(StoreError::Corrupt);
-    }
-    let mut exact = [0u8; SECRET_BYTES];
-    exact.copy_from_slice(bytes);
-    Ok(RecoverySecret::import(&mut exact))
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn recovery_secret_matches(bytes: &[u8], secret: &RecoverySecret) -> bool {
-    bytes.len() == SECRET_BYTES
-        && secret.expose(|expected| bool::from(expected.as_slice().ct_eq(bytes)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn namespace_and_recipient_are_canonical_public_keys() {
-        let application = ApplicationId::new("vault.example").unwrap();
-        let recipient: RecipientId = "ab".repeat(32).parse().unwrap();
-        assert_eq!(
-            service_name(&application),
-            "fido-key-wrap.local-secret:vault.example"
-        );
-        assert_eq!(recipient_name(recipient), "ab".repeat(32));
-        assert_eq!(
-            recovery_service_name(&application),
-            "fido-key-wrap.recovery-secret:vault.example"
-        );
+    fn exact_binary_and_redaction() {
+        let mut source = [0xab; 32];
+        let secret = Secret::import(&mut source);
+        assert_eq!(source, [0; 32]);
+        assert!(binary_matches(&[0xab; 32], &secret));
+        assert!(import_binary(&[0; 31]).is_err());
+        assert_eq!(format!("{secret:?}"), "Secret([REDACTED])");
     }
-
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn binary_import_is_exact() {
-        let mut source = [0x5au8; SECRET_BYTES];
-        let secret = LocalSecret::import(&mut source);
-        assert!(binary_matches(&[0x5a; SECRET_BYTES], &secret));
-
-        let binary = import_binary(&[0x5a; SECRET_BYTES]).unwrap();
-        assert!(binary_matches(&[0x5a; SECRET_BYTES], &binary));
-
-        assert!(matches!(import_binary(&[0; 31]), Err(StoreError::Corrupt)));
-
-        let mut recovery_source = [0x6bu8; SECRET_BYTES];
-        let recovery = RecoverySecret::import(&mut recovery_source);
-        assert!(recovery_secret_matches(&[0x6b; SECRET_BYTES], &recovery));
-        let imported = import_recovery_secret(&[0x6b; SECRET_BYTES]).unwrap();
-        assert!(recovery_secret_matches(&[0x6b; SECRET_BYTES], &imported));
-        assert!(matches!(
-            import_recovery_secret(&[0; 31]),
-            Err(StoreError::Corrupt)
-        ));
+    fn unsupported_access_never_falls_back() {
+        assert_eq!(
+            NativeStore
+                .load("vault.example", &[0; 32], Access::UserAuthentication)
+                .unwrap_err(),
+            StoreError::Unsupported
+        );
+        assert_eq!(
+            NativeStore
+                .load("vault.example", &[0; 32], Access::MacosLogin)
+                .unwrap_err(),
+            StoreError::Unsupported
+        );
     }
 }

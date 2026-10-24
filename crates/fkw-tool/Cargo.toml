@@ -10,15 +10,11 @@ name = "fkw"
 path = "src/main.rs"
 
 [dependencies]
-aes-gcm = { workspace = true, features = ["alloc"] }
 anyhow.workspace = true
 clap.workspace = true
 fido-key-wrap = { path = "../fido-key-wrap" }
-getrandom.workspace = true
-hkdf.workspace = true
-libc.workspace = true
+tempfile.workspace = true
 rpassword.workspace = true
-sha2.workspace = true
 zeroize.workspace = true
 
 [lints]

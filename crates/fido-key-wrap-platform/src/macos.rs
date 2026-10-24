@@ -1,5 +1,5 @@
+use crate::{EntryId, Secret};
 use core_foundation::{base::ToVoid, data::CFData, dictionary::CFMutableDictionary};
-use fido_key_wrap::{LocalSecret, RecipientId};
 use security_framework::{
     access_control::{ProtectionMode, SecAccessControl},
     base::Error as NativeError,
@@ -18,8 +18,8 @@ use security_framework_sys::base::{
 use zeroize::Zeroizing;
 
 use crate::{
-    NativeLocalSecretStore, Removal, Result, StoreError, binary_matches, import_binary,
-    recipient_name, service_name,
+    Removal, Result, StandardStore, StoreError, binary_matches, import_binary, recipient_name,
+    service_name,
 };
 
 const LABEL: &str = "fido key wrap local secret";
@@ -34,11 +34,7 @@ pub(crate) enum StoreKind {
     LoginKeychain,
 }
 
-pub(crate) fn create(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    secret: &LocalSecret,
-) -> Result<()> {
+pub(crate) fn create(store: &StandardStore, recipient: EntryId, secret: &Secret) -> Result<()> {
     let result = match store.kind {
         StoreKind::DataProtection => add_data_protection(store, recipient, secret),
         StoreKind::LoginKeychain => add_login_keychain(store, recipient, secret),
@@ -62,7 +58,7 @@ pub(crate) fn create(
     }
 }
 
-pub(crate) fn load(store: &NativeLocalSecretStore, recipient: RecipientId) -> Result<LocalSecret> {
+pub(crate) fn load(store: &StandardStore, recipient: EntryId) -> Result<Secret> {
     let mut values = find_values(store, recipient)?;
     match values.len() {
         0 => Err(StoreError::Missing),
@@ -71,7 +67,7 @@ pub(crate) fn load(store: &NativeLocalSecretStore, recipient: RecipientId) -> Re
     }
 }
 
-pub(crate) fn remove(store: &NativeLocalSecretStore, recipient: RecipientId) -> Result<Removal> {
+pub(crate) fn remove(store: &StandardStore, recipient: EntryId) -> Result<Removal> {
     let mut items = find_items(store, recipient)?;
     match items.len() {
         0 => Ok(Removal::Absent),
@@ -91,9 +87,9 @@ pub(crate) fn remove(store: &NativeLocalSecretStore, recipient: RecipientId) -> 
 }
 
 fn reconcile_after_add_error(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    secret: &LocalSecret,
+    store: &StandardStore,
+    recipient: EntryId,
+    secret: &Secret,
     native_error: NativeError,
 ) -> Result<()> {
     let values = find_values(store, recipient).map_err(|_| StoreError::StateUncertain)?;
@@ -106,11 +102,7 @@ fn reconcile_after_add_error(
     }
 }
 
-fn verify_created(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    secret: &LocalSecret,
-) -> Result<()> {
+fn verify_created(store: &StandardStore, recipient: EntryId, secret: &Secret) -> Result<()> {
     let values = find_values(store, recipient)?;
     match values.as_slice() {
         [bytes] if binary_matches(bytes, secret) => Ok(()),
@@ -121,9 +113,9 @@ fn verify_created(
 }
 
 fn add_login_keychain(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    secret: &LocalSecret,
+    store: &StandardStore,
+    recipient: EntryId,
+    secret: &Secret,
 ) -> security_framework::base::Result<()> {
     let keychain = SecKeychain::default()?;
     secret.expose(|bytes| {
@@ -142,9 +134,9 @@ fn add_login_keychain(
 }
 
 fn add_data_protection(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    secret: &LocalSecret,
+    store: &StandardStore,
+    recipient: EntryId,
+    secret: &Secret,
 ) -> security_framework::base::Result<()> {
     secret.expose(|bytes| {
         let value = ItemAddValue::Data {
@@ -180,10 +172,7 @@ fn add_data_protection(
     })
 }
 
-fn find_values(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-) -> Result<Vec<Zeroizing<Vec<u8>>>> {
+fn find_values(store: &StandardStore, recipient: EntryId) -> Result<Vec<Zeroizing<Vec<u8>>>> {
     let results = match query(store, recipient, true)?.search() {
         Ok(results) => results,
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(Vec::new()),
@@ -198,10 +187,7 @@ fn find_values(
         .collect()
 }
 
-fn find_items(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-) -> Result<Vec<SecKeychainItem>> {
+fn find_items(store: &StandardStore, recipient: EntryId) -> Result<Vec<SecKeychainItem>> {
     let mut query = query(store, recipient, false)?;
     query.load_refs(true);
     let results = match query.search() {
@@ -218,11 +204,7 @@ fn find_items(
         .collect()
 }
 
-fn query(
-    store: &NativeLocalSecretStore,
-    recipient: RecipientId,
-    load_data: bool,
-) -> Result<ItemSearchOptions> {
+fn query(store: &StandardStore, recipient: EntryId, load_data: bool) -> Result<ItemSearchOptions> {
     let mut query = ItemSearchOptions::new();
     query
         .class(ItemClass::generic_password())

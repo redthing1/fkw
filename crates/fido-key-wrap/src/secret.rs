@@ -1,264 +1,62 @@
+use crate::{Error, Result};
 use std::fmt;
-
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{Error, RecipientId, Result};
-
-const SECRET_BYTES: usize = 32;
-
-/// uniformly random 256-bit application root key.
-pub struct RootKey {
-    bytes: Zeroizing<[u8; SECRET_BYTES]>,
-}
-
-/// uniformly random 256-bit recovery secret for one recovery recipient.
-pub struct RecoverySecret {
-    bytes: Zeroizing<[u8; SECRET_BYTES]>,
-}
-
-/// uniformly random local factor for one fido recipient.
-pub struct LocalSecret {
-    bytes: Zeroizing<[u8; SECRET_BYTES]>,
-}
-
-impl LocalSecret {
-    /// imports an existing uniformly random local secret and clears the source.
-    ///
-    /// passwords, derived passwords, and other guessable values are not valid
-    /// local secrets.
-    #[must_use]
-    pub fn import(source: &mut [u8; SECRET_BYTES]) -> Self {
-        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
-        bytes.copy_from_slice(source);
-        source.zeroize();
-        Self { bytes }
-    }
-
-    /// borrows the local secret for one application-defined storage operation.
-    ///
-    /// the closure can copy or return these bytes. any such copy is owned and
-    /// must be cleared by the application.
-    pub fn expose<T>(&self, use_secret: impl FnOnce(&[u8; SECRET_BYTES]) -> T) -> T {
-        use_secret(&self.bytes)
-    }
-
-    pub(crate) fn random() -> Result<Self> {
-        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
-        getrandom::fill(bytes.as_mut()).map_err(|_| Error::RandomUnavailable)?;
-        Ok(Self { bytes })
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8; SECRET_BYTES] {
-        &self.bytes
-    }
-}
-
-impl fmt::Debug for LocalSecret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("LocalSecret([REDACTED])")
-    }
-}
-
-/// newly created fido-and-local-secret route and its local factor.
-pub struct LocalSecretRecipient {
-    recipient_id: RecipientId,
-    secret: LocalSecret,
-}
-
-impl LocalSecretRecipient {
-    pub(crate) const fn new(recipient_id: RecipientId, secret: LocalSecret) -> Self {
-        Self {
-            recipient_id,
-            secret,
+/// Opaque passphrase bytes. No implicit text normalization.
+pub struct Passphrase(pub(crate) Zeroizing<Vec<u8>>);
+impl Passphrase {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let bytes = Zeroizing::new(bytes.into());
+        if bytes.is_empty() || bytes.len() > 1024 {
+            return Err(Error::InvalidInput("passphrase must contain 1–1024 bytes"));
         }
+        Ok(Self(bytes))
     }
-
-    /// returns the recipient selected by this local secret.
-    #[must_use]
-    pub const fn recipient_id(&self) -> RecipientId {
-        self.recipient_id
-    }
-
-    /// borrows the newly generated local secret.
-    #[must_use]
-    pub const fn secret(&self) -> &LocalSecret {
-        &self.secret
-    }
-
-    /// consumes the enrollment result and returns its local secret.
-    #[must_use]
-    pub fn into_secret(self) -> LocalSecret {
-        self.secret
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        let mut a = Zeroizing::new([0u8; 1024]);
+        let mut b = Zeroizing::new([0u8; 1024]);
+        a[..self.0.len()].copy_from_slice(&self.0);
+        b[..other.0.len()].copy_from_slice(&other.0);
+        bool::from(a.as_slice().ct_eq(b.as_slice()) & self.0.len().ct_eq(&other.0.len()))
     }
 }
-
-impl fmt::Debug for LocalSecretRecipient {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalSecretRecipient")
-            .field("recipient_id", &self.recipient_id)
-            .field("secret", &"[REDACTED]")
-            .finish()
+impl fmt::Debug for Passphrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Passphrase([REDACTED])")
     }
 }
-
+/// Generated random recovery material. Store it before enrolling its method.
+pub struct RecoverySecret(pub(crate) Zeroizing<[u8; 32]>);
 impl RecoverySecret {
-    /// imports an existing recovery secret and clears the source.
-    #[must_use]
-    pub fn import(source: &mut [u8; SECRET_BYTES]) -> Self {
-        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
-        bytes.copy_from_slice(source);
-        source.zeroize();
-        Self { bytes }
+    pub fn generate() -> Result<Self> {
+        Ok(Self(crate::crypto::random()?))
     }
-
-    /// borrows the recovery secret for one application-defined storage operation.
-    ///
-    /// the closure can copy or return these bytes. any such copy is owned and
-    /// must be cleared by the application.
-    pub fn expose<T>(&self, use_secret: impl FnOnce(&[u8; SECRET_BYTES]) -> T) -> T {
-        use_secret(&self.bytes)
+    /// Imports exactly 32 random bytes and erases the source. Never use a password.
+    pub fn import(bytes: &mut [u8; 32]) -> Self {
+        let value = Self(Zeroizing::new(*bytes));
+        bytes.zeroize();
+        value
     }
-
-    pub(crate) fn random() -> Result<Self> {
-        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
-        getrandom::fill(bytes.as_mut()).map_err(|_| Error::RandomUnavailable)?;
-        Ok(Self { bytes })
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8; SECRET_BYTES] {
-        &self.bytes
+    /// Exposes bytes for explicit backup; the caller must protect any copy.
+    pub fn expose<T>(&self, f: impl FnOnce(&[u8; 32]) -> T) -> T {
+        f(&self.0)
     }
 }
-
 impl fmt::Debug for RecoverySecret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RecoverySecret([REDACTED])")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecoverySecret([REDACTED])")
     }
 }
-
-/// newly created recovery-secret route and its separately stored secret.
-pub struct RecoverySecretRecipient {
-    recipient_id: RecipientId,
-    secret: RecoverySecret,
-}
-
-impl RecoverySecretRecipient {
-    pub(crate) const fn new(recipient_id: RecipientId, secret: RecoverySecret) -> Self {
-        Self {
-            recipient_id,
-            secret,
-        }
-    }
-
-    /// returns the recipient selected by this recovery secret.
-    #[must_use]
-    pub const fn recipient_id(&self) -> RecipientId {
-        self.recipient_id
-    }
-
-    /// borrows the newly generated recovery secret.
-    #[must_use]
-    pub const fn secret(&self) -> &RecoverySecret {
-        &self.secret
-    }
-
-    /// consumes the enrollment result and returns its recovery secret.
-    #[must_use]
-    pub fn into_secret(self) -> RecoverySecret {
-        self.secret
+/// Purpose-separated application key, erased on drop.
+pub struct DerivedKey(pub(crate) Zeroizing<[u8; 32]>);
+impl DerivedKey {
+    pub fn expose<T>(&self, f: impl FnOnce(&[u8; 32]) -> T) -> T {
+        f(&self.0)
     }
 }
-
-impl fmt::Debug for RecoverySecretRecipient {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RecoverySecretRecipient")
-            .field("recipient_id", &self.recipient_id)
-            .field("secret", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl RootKey {
-    /// imports an already uniformly random 256-bit root key and clears the source.
-    ///
-    /// passwords, passphrases, api tokens, hashes of low-entropy input, and
-    /// other guessable values are not valid root keys.
-    #[must_use]
-    pub fn import(random_bytes: &mut [u8; 32]) -> Self {
-        let mut bytes = Zeroizing::new([0u8; 32]);
-        bytes.copy_from_slice(random_bytes);
-        random_bytes.zeroize();
-        Self { bytes }
-    }
-
-    /// borrows the root for one application-defined operation.
-    ///
-    /// the closure can copy or return these bytes. any such copy is owned and
-    /// must be cleared by the application.
-    pub fn expose<T>(&self, use_key: impl FnOnce(&[u8; 32]) -> T) -> T {
-        use_key(&self.bytes)
-    }
-
-    pub(crate) fn random() -> Result<Self> {
-        let mut bytes = Zeroizing::new([0u8; 32]);
-        getrandom::fill(bytes.as_mut()).map_err(|_| Error::RandomUnavailable)?;
-        Ok(Self { bytes })
-    }
-
-    pub(crate) fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Self {
-        Self { bytes }
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8; 32] {
-        &self.bytes
-    }
-}
-
-impl fmt::Debug for RootKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RootKey([REDACTED])")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn import_clears_the_source_and_debug_is_redacted() {
-        let mut source = [0x42; 32];
-        let key = RootKey::import(&mut source);
-        assert_eq!(source, [0; 32]);
-        assert_eq!(format!("{key:?}"), "RootKey([REDACTED])");
-    }
-
-    #[test]
-    fn recovery_import_clears_source_and_debug_is_redacted() {
-        let mut source = [0x24; SECRET_BYTES];
-        let secret = RecoverySecret::import(&mut source);
-        assert_eq!(source, [0; SECRET_BYTES]);
-        assert_eq!(format!("{secret:?}"), "RecoverySecret([REDACTED])");
-
-        let recipient =
-            RecoverySecretRecipient::new(RecipientId::from_bytes([0x42; SECRET_BYTES]), secret);
-        let rendered = format!("{recipient:?}");
-        assert!(rendered.contains("[REDACTED]"));
-        assert!(!rendered.contains("RecoverySecret(["));
-    }
-
-    #[test]
-    fn local_import_clears_source_and_debug_is_redacted() {
-        let mut source = [0x36; SECRET_BYTES];
-        let secret = LocalSecret::import(&mut source);
-        assert_eq!(source, [0; SECRET_BYTES]);
-        assert_eq!(format!("{secret:?}"), "LocalSecret([REDACTED])");
-
-        let recipient =
-            LocalSecretRecipient::new(RecipientId::from_bytes([0x57; SECRET_BYTES]), secret);
-        let rendered = format!("{recipient:?}");
-        assert!(rendered.contains("[REDACTED]"));
-        assert!(!rendered.contains("LocalSecret(["));
+impl fmt::Debug for DerivedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DerivedKey([REDACTED])")
     }
 }

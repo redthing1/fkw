@@ -1,2617 +1,526 @@
-use subtle::ConstantTimeEq;
-
-#[cfg(test)]
-use std::cell::Cell;
-
 use crate::{
-    ApplicationId, AuthenticatorFailure, Enrollment, Error, Interaction, KeyEnvelope, LocalSecret,
-    LocalSecretRecipient, Operation, Passphrase, PassphraseLimits, PassphraseParameters,
-    PassphrasePrompt, PassphrasePurpose, RecipientId, RecoverySecret, RecoverySecretRecipient,
-    Result, RootKey,
-    backend::{
-        AuthenticatorBackend, CredentialBinding, ManagedEnrollment, ManagedRequest, PrfRequest,
-    },
-    crypto::{self, DerivedKey},
-    envelope::{
-        FidoAndLocalSecretRecipient, FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor,
-        MAX_CREDENTIAL_ID, MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord,
-        RecoverySecretRecord,
-    },
-    policy::{FidoStorage, RecipientPolicy, validate_label},
+    ApplicationId, DerivedKey, Enrollment, Envelope, Error, FidoConfig, Interaction, KdfCost,
+    Keystore, Method, MethodId, NativeStore, Operation, PassphrasePurpose, Removal, Result,
+    StoreError, StoreSecret, crypto,
+    envelope::{Kdf, MAX_METHODS, Record},
+    platform::{Keys, prompt},
 };
+use std::fmt;
+use zeroize::Zeroizing;
 
-use crate::FidoConfig;
-
-const ROOT_BYTES: usize = 32;
-const WRAPPED_ROOT_BYTES: usize = 48;
-const COMBINED_WRAPPED_ROOT_BYTES: usize = 64;
-const RANDOM_ATTEMPTS: usize = 32;
-
-#[cfg(test)]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum StagedFault {
-    CanonicalDecode,
-    RootMismatch,
-    EnvelopeMac,
+/// Trusted application policy and operational dependencies. Construction is inert.
+pub struct Protector {
+    application: ApplicationId,
+    allowed: Option<Vec<Method>>,
+    max_cost: KdfCost,
+    keys: Keys,
+    store: Box<dyn Keystore>,
 }
-
-#[cfg(test)]
-thread_local! {
-    static STAGED_FAULT: Cell<Option<StagedFault>> = const { Cell::new(None) };
+/// An authenticated envelope and a zeroizing root. Contains no platform handles.
+pub struct UnlockedKey {
+    pub(crate) root: Zeroizing<[u8; 32]>,
+    pub(crate) envelope: Envelope,
 }
-
-#[cfg(test)]
-fn fail_next_staged_validation(fault: StagedFault) {
-    STAGED_FAULT.set(Some(fault));
-}
-
-#[cfg(test)]
-fn take_staged_fault(fault: StagedFault) -> bool {
-    if STAGED_FAULT.get() == Some(fault) {
-        STAGED_FAULT.set(None);
-        true
-    } else {
-        false
+impl fmt::Debug for UnlockedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnlockedKey")
+            .field("envelope", &self.envelope)
+            .field("root", &"[REDACTED]")
+            .finish()
     }
 }
-
-/// concrete facade for root protection and recovery.
-pub struct KeyProtector {
-    application_id: ApplicationId,
-    passphrase_limits: PassphraseLimits,
-    backend: AuthenticatorBackend,
-}
-
-impl KeyProtector {
-    /// constructs a protector using the default passphrase limits and native
-    /// operation limits.
-    ///
-    /// construction performs no native loading, device discovery, or
-    /// interaction.
+impl UnlockedKey {
     #[must_use]
-    pub fn new(application_id: ApplicationId) -> Self {
+    pub const fn envelope(&self) -> &Envelope {
+        &self.envelope
+    }
+    /// Authenticates another snapshot of the same protected key.
+    pub(crate) fn authenticate(&self, envelope: &Envelope) -> Result<()> {
+        if envelope.application != self.envelope.application || envelope.id != self.envelope.id {
+            return Err(Error::UnlockFailed);
+        }
+        envelope.verify(&self.root)
+    }
+    /// Derives a separate 32-byte application key for a stable, explicit purpose.
+    pub fn derive_key(&self, purpose: &str) -> Result<DerivedKey> {
+        if purpose.is_empty() || purpose.len() > 128 {
+            return Err(Error::InvalidInput("purpose must contain 1–128 bytes"));
+        }
+        Ok(DerivedKey(crypto::derive(
+            self.root.as_slice(),
+            &self.envelope.id,
+            &[
+                b"fkw/v2/application",
+                self.envelope.application.as_str().as_bytes(),
+                purpose.as_bytes(),
+            ],
+        )))
+    }
+}
+impl Protector {
+    #[must_use]
+    pub fn new(application: ApplicationId) -> Self {
         Self {
-            application_id,
-            passphrase_limits: PassphraseLimits::DESKTOP,
-            backend: AuthenticatorBackend::native(FidoConfig::default()),
+            application,
+            allowed: None,
+            max_cost: KdfCost::MAX,
+            keys: Keys::new(FidoConfig::default()),
+            store: Box::new(NativeStore),
         }
     }
-
-    /// replaces the trusted native-operation limits.
+    /// Restricts every method in an envelope, including unselected alternatives.
+    pub fn allow_only(mut self, methods: impl IntoIterator<Item = Method>) -> Result<Self> {
+        let methods: Vec<_> = methods.into_iter().collect();
+        if methods.is_empty() {
+            return Err(Error::InvalidInput("empty method allow-list"));
+        }
+        self.allowed = Some(methods);
+        Ok(self)
+    }
     #[must_use]
-    pub fn with_fido_config(mut self, config: FidoConfig) -> Self {
-        self.backend = AuthenticatorBackend::native(config);
+    pub const fn with_max_kdf_cost(mut self, cost: KdfCost) -> Self {
+        self.max_cost = cost;
         self
     }
-
-    /// replaces this process's immutable passphrase-work admission ceiling.
     #[must_use]
-    pub const fn with_passphrase_limits(mut self, limits: PassphraseLimits) -> Self {
-        self.passphrase_limits = limits;
+    pub const fn with_fido_config(mut self, config: FidoConfig) -> Self {
+        self.keys.config = config;
         self
     }
-
-    /// generates a random root and immediately protects it through one route.
-    ///
-    /// # errors
-    ///
-    /// returns an error without exposing an unprotected generated root when
-    /// enrollment, interaction, derivation, or staged route verification fails.
-    pub fn create_root(
-        &mut self,
-        enrollment: Enrollment,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RootKey, KeyEnvelope, RecipientId)> {
-        let root = RootKey::random()?;
-        let (envelope, recipient) =
-            self.protect_root_for_operation(&root, enrollment, Operation::CreateRoot, interaction)?;
-        Ok((root, envelope, recipient))
+    #[must_use]
+    pub fn with_keystore(mut self, store: impl Keystore + 'static) -> Self {
+        self.store = Box::new(store);
+        self
     }
-
-    /// protects an existing uniformly random root through one route.
-    ///
-    /// # errors
-    ///
-    /// returns an error when enrollment, interaction, derivation, or staged
-    /// route verification fails.
-    pub fn protect_root(
-        &mut self,
-        root: &RootKey,
-        enrollment: Enrollment,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(KeyEnvelope, RecipientId)> {
-        self.protect_root_for_operation(root, enrollment, Operation::ProtectRoot, interaction)
+    #[must_use]
+    pub const fn application_id(&self) -> &ApplicationId {
+        &self.application
     }
-
-    /// generates a random root and protects it with a new recovery secret.
-    ///
-    /// the recovery secret is returned only after the complete staged envelope
-    /// has been recovered and authenticated.
-    pub fn create_root_with_recovery_secret(
+    #[cfg(test)]
+    pub(crate) fn with_test_device(
+        mut self,
+        device: std::sync::Arc<crate::platform::fake::Device>,
+    ) -> Self {
+        self.keys.fake = Some(device);
+        self
+    }
+    pub fn inspect_authenticators(&self) -> Result<Vec<crate::diagnostics::DeviceReport>> {
+        Ok(fido_key_wrap_libfido2::Backend::new(self.keys.config).inspect_authenticators()?)
+    }
+    /// Generates a root and enrolls its first method. Persist the returned envelope.
+    /// If saving fails, retain this handle and retry the save, not enrollment.
+    pub fn create(
         &self,
-        label: impl Into<String>,
-    ) -> Result<(RootKey, KeyEnvelope, RecoverySecretRecipient)> {
-        let root = RootKey::random()?;
-        let (envelope, recovery) = self.protect_root_with_recovery_secret(&root, label)?;
-        Ok((root, envelope, recovery))
-    }
-
-    /// protects an existing uniformly random root with a new recovery secret.
-    pub fn protect_root_with_recovery_secret(
-        &self,
-        root: &RootKey,
-        label: impl Into<String>,
-    ) -> Result<(KeyEnvelope, RecoverySecretRecipient)> {
-        let label = validate_dedicated_label(label)?;
-        let envelope = KeyEnvelope {
-            application_id: self.application_id.clone(),
-            envelope_id: random_array()?,
-            recipients: Vec::new(),
-            mac: [0; ROOT_BYTES],
+        enrollment: &Enrollment,
+        interaction: &mut dyn Interaction,
+    ) -> Result<UnlockedKey> {
+        self.check_enrollment(enrollment)?;
+        let root = crypto::random()?;
+        let base = Envelope {
+            application: self.application.clone(),
+            id: *crypto::random()?,
+            records: Vec::new(),
+            mac: [0; 32],
         };
-        let (record, secret, key) = Self::new_recovery_secret_record(&envelope, root, label)?;
-        let id = record.id();
-        let envelope = Self::stage_record(envelope, record, root, &RecoveryKeys::Recovery(key))?;
-        Ok((envelope, RecoverySecretRecipient::new(id, secret)))
+        let envelope = self.enroll(&base, &root, enrollment, None, interaction)?;
+        Ok(UnlockedKey { root, envelope })
     }
-
-    /// generates a random root protected by security-key presence and a local secret.
-    ///
-    /// the local secret is returned only after the complete staged route has
-    /// been recovered and authenticated.
-    pub fn create_root_with_fido_and_local_secret(
-        &mut self,
-        label: impl Into<String>,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RootKey, KeyEnvelope, LocalSecretRecipient)> {
-        let root = RootKey::random()?;
-        let (envelope, local) = self.protect_root_with_fido_and_local_secret_for_operation(
-            &root,
-            label,
-            Operation::CreateRoot,
-            interaction,
-        )?;
-        Ok((root, envelope, local))
-    }
-
-    /// protects an existing root with security-key presence and a local secret.
-    pub fn protect_root_with_fido_and_local_secret(
-        &mut self,
-        root: &RootKey,
-        label: impl Into<String>,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(KeyEnvelope, LocalSecretRecipient)> {
-        self.protect_root_with_fido_and_local_secret_for_operation(
-            root,
-            label,
-            Operation::ProtectRoot,
-            interaction,
-        )
-    }
-
-    /// recovers a root through exactly one selected recipient.
-    ///
-    /// # errors
-    ///
-    /// returns an error without searching another recipient or weakening the
-    /// selected policy.
+    /// Unlocks exactly the selected method; never tries another route.
     pub fn unlock(
-        &mut self,
-        envelope: &KeyEnvelope,
-        recipient: RecipientId,
-        interaction: &mut dyn Interaction,
-    ) -> Result<RootKey> {
-        self.require_application(envelope)?;
-        let record = envelope.find(recipient)?;
-        self.admit_record(record)?;
-
-        let root = match record {
-            RecipientRecord::Passphrase(passphrase_record) => {
-                let passphrase = request_passphrase(
-                    interaction,
-                    Operation::Unlock,
-                    &passphrase_record.label,
-                    PassphrasePurpose::Unlock,
-                )?;
-                let key = crypto::derive_passphrase_key(
-                    record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &passphrase,
-                )?;
-                drop(passphrase);
-                crypto::unwrap_passphrase_root(
-                    passphrase_record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &key,
-                )?
-            }
-            RecipientRecord::RecoverySecret(_) | RecipientRecord::FidoAndLocalSecret(_) => {
-                return Err(Error::UnlockFailed);
-            }
-            RecipientRecord::Fido(fido_record) => {
-                let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
-                let key = crypto::derive_fido_key(
-                    record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &prf,
-                )?;
-                drop(prf);
-                crypto::unwrap_fido_root(
-                    fido_record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &key,
-                )?
-            }
-            RecipientRecord::FidoAndPassphrase(combined_record) => {
-                let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
-                let fido_key = crypto::derive_fido_key(
-                    record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &prf,
-                )?;
-                drop(prf);
-                let inner = crypto::unwrap_combined_outer(
-                    combined_record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &fido_key,
-                )?;
-                drop(fido_key);
-
-                let passphrase = request_passphrase(
-                    interaction,
-                    Operation::Unlock,
-                    &combined_record.label,
-                    PassphrasePurpose::Unlock,
-                )?;
-                let passphrase_key = crypto::derive_passphrase_key(
-                    record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &passphrase,
-                )?;
-                drop(passphrase);
-                crypto::unwrap_combined_inner(
-                    combined_record,
-                    &self.application_id,
-                    &envelope.envelope_id,
-                    &inner,
-                    &passphrase_key,
-                )?
-            }
-        };
-
-        if crypto::envelope_mac_matches(envelope, &root)? {
-            Ok(root)
-        } else {
-            Err(Error::UnlockFailed)
-        }
-    }
-
-    /// recovers a root through exactly one selected recovery-secret recipient.
-    pub fn unlock_with_recovery_secret(
         &self,
-        envelope: &KeyEnvelope,
-        recipient: RecipientId,
-        secret: &RecoverySecret,
-    ) -> Result<RootKey> {
-        self.require_application(envelope)?;
-        let RecipientRecord::RecoverySecret(record) =
-            envelope.find(recipient).map_err(|_| Error::UnlockFailed)?
-        else {
-            return Err(Error::UnlockFailed);
-        };
-        let key = crypto::derive_recovery_secret_key(
-            record,
-            &self.application_id,
-            &envelope.envelope_id,
-            secret,
-        )?;
-        let root = crypto::unwrap_recovery_secret_root(
-            record,
-            &self.application_id,
-            &envelope.envelope_id,
-            &key,
-        )?;
-        if crypto::envelope_mac_matches(envelope, &root)? {
-            Ok(root)
-        } else {
-            Err(Error::UnlockFailed)
-        }
-    }
-
-    /// recovers a root through security-key presence and the selected local secret.
-    pub fn unlock_with_fido_and_local_secret(
-        &mut self,
-        envelope: &KeyEnvelope,
-        recipient: RecipientId,
-        secret: &LocalSecret,
+        envelope: &Envelope,
+        method: MethodId,
         interaction: &mut dyn Interaction,
-    ) -> Result<RootKey> {
-        self.require_application(envelope)?;
-        let record = envelope.find(recipient).map_err(|_| Error::UnlockFailed)?;
-        let RecipientRecord::FidoAndLocalSecret(inner) = record else {
-            return Err(Error::UnlockFailed);
-        };
-        let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
-        let key = crypto::derive_fido_local_key(
-            inner,
-            &self.application_id,
-            &envelope.envelope_id,
-            &prf,
-            secret,
-        )?;
-        drop(prf);
-        let root = crypto::unwrap_fido_local_root(
-            inner,
-            &self.application_id,
-            &envelope.envelope_id,
-            &key,
-        )?;
-        if crypto::envelope_mac_matches(envelope, &root)? {
-            Ok(root)
-        } else {
-            Err(Error::UnlockFailed)
-        }
-    }
-
-    /// adds another alternative recovery route transactionally.
-    ///
-    /// # errors
-    ///
-    /// authenticates the current envelope before factor interaction and leaves
-    /// it byte-for-byte unchanged on every failure.
-    pub fn add_recipient(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        enrollment: Enrollment,
-        interaction: &mut dyn Interaction,
-    ) -> Result<RecipientId> {
-        self.require_authenticated(envelope, root)?;
-        if envelope.recipients.len() >= MAX_RECIPIENTS {
-            return Err(Error::TooManyRecipients);
-        }
-        self.admit_enrollment(&enrollment)?;
-
-        let (record, keys, managed) = self.enroll_recipient(
-            envelope,
+    ) -> Result<UnlockedKey> {
+        self.check_envelope(envelope)?;
+        let record = envelope.record(method)?;
+        self.check_selected(record)?;
+        let root = self.unwrap(envelope, record, interaction)?;
+        envelope.verify(&root)?;
+        Ok(UnlockedKey {
             root,
-            enrollment,
-            Operation::AddRecipient,
-            interaction,
-        )?;
-        let id = record.id();
-        let staged =
-            self.stage_enrollment(envelope.clone(), &record, root, &keys, managed, interaction)?;
-        *envelope = staged;
+            envelope: envelope.clone(),
+        })
+    }
+    /// Adds an alternative. The handle changes only after successful enrollment.
+    pub fn add_method(
+        &self,
+        key: &mut UnlockedKey,
+        enrollment: &Enrollment,
+        interaction: &mut dyn Interaction,
+    ) -> Result<MethodId> {
+        self.check_key(key)?;
+        if key.envelope.records.len() == MAX_METHODS {
+            return Err(Error::TooManyMethods);
+        }
+        let next = self.enroll(&key.envelope, &key.root, enrollment, None, interaction)?;
+        let id = next.records.last().expect("new method").id;
+        key.envelope = next;
         Ok(id)
     }
-
-    /// adds a new recovery-secret route transactionally.
-    pub fn add_recovery_secret(
+    /// Enrolls a replacement before removing the old route. External factors remain.
+    pub fn replace_method(
         &self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        label: impl Into<String>,
-    ) -> Result<RecoverySecretRecipient> {
-        self.require_authenticated(envelope, root)?;
-        if envelope.recipients.len() >= MAX_RECIPIENTS {
-            return Err(Error::TooManyRecipients);
-        }
-        let label = validate_dedicated_label(label)?;
-        let (record, secret, key) = Self::new_recovery_secret_record(envelope, root, label)?;
-        let id = record.id();
-        let staged =
-            Self::stage_record(envelope.clone(), record, root, &RecoveryKeys::Recovery(key))?;
-        *envelope = staged;
-        Ok(RecoverySecretRecipient::new(id, secret))
-    }
-
-    /// adds a security-key-presence and local-secret route transactionally.
-    pub fn add_fido_and_local_secret(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        label: impl Into<String>,
+        key: &mut UnlockedKey,
+        old: MethodId,
+        enrollment: &Enrollment,
         interaction: &mut dyn Interaction,
-    ) -> Result<LocalSecretRecipient> {
-        self.require_authenticated(envelope, root)?;
-        if envelope.recipients.len() >= MAX_RECIPIENTS {
-            return Err(Error::TooManyRecipients);
-        }
-        let label = validate_dedicated_label(label)?;
-        let (record, secret, key) = self.enroll_fido_local_recipient(
-            envelope,
-            root,
-            label,
-            Operation::AddRecipient,
-            interaction,
-        )?;
-        let id = record.id();
-        let staged = Self::stage_record(
-            envelope.clone(),
-            record,
-            root,
-            &RecoveryKeys::FidoAndLocal(key),
-        )?;
-        *envelope = staged;
-        Ok(LocalSecretRecipient::new(id, secret))
+    ) -> Result<MethodId> {
+        self.check_key(key)?;
+        key.envelope.record(old)?;
+        let next = self.enroll(&key.envelope, &key.root, enrollment, Some(old), interaction)?;
+        let id = next.records.last().expect("new method").id;
+        key.envelope = next;
+        Ok(id)
     }
-
-    /// removes one recovery route transactionally.
-    ///
-    /// # errors
-    ///
-    /// rejects an absent recipient, a final recipient, an application
-    /// mismatch, or a root that does not authenticate the current envelope.
-    pub fn remove_recipient(
-        &self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        recipient: RecipientId,
-    ) -> Result<()> {
-        self.require_application(envelope)?;
-        let index = envelope
-            .recipients
-            .binary_search_by_key(&recipient, RecipientRecord::id)
-            .map_err(|_| Error::RecipientNotFound)?;
-        if envelope.recipients.len() == 1 {
-            return Err(Error::WouldRemoveLastRecipient);
+    /// Removes an alternative, without deleting any external factor.
+    pub fn remove_method(&self, key: &mut UnlockedKey, method: MethodId) -> Result<()> {
+        self.check_key(key)?;
+        key.envelope.record(method)?;
+        if key.envelope.records.len() == 1 {
+            return Err(Error::LastMethod);
         }
-        crypto::verify_envelope_mac(envelope, root)?;
-
-        let mut staged = envelope.clone();
-        staged.recipients.remove(index);
-        staged.mac = crypto::compute_envelope_mac(&staged, root)?;
-        let staged = canonicalize(&staged)?;
-        crypto::verify_envelope_mac(&staged, root)?;
-        *envelope = staged;
+        let mut next = key.envelope.clone();
+        next.records.retain(|r| r.id != method);
+        next.sign(&key.root);
+        key.envelope = next;
         Ok(())
     }
-
-    /// verifies that the selected managed credential is present.
-    ///
-    /// the complete envelope is authenticated before interaction. success
-    /// proves the signed credential and its exact management record on one
-    /// selected authenticator. the envelope is not changed.
-    pub fn verify_managed_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        recipient: RecipientId,
+    /// Retires a managed credential from an old authenticated envelope. Requires
+    /// a surviving envelope with that method removed and the same root. Publish
+    /// and independently unlock the survivor before calling this operation.
+    pub fn retire_credential(
+        &self,
+        old: &Envelope,
+        method: MethodId,
+        survivor: &UnlockedKey,
         interaction: &mut dyn Interaction,
     ) -> Result<()> {
-        self.require_authenticated(envelope, root)?;
-        let record = envelope.find(recipient)?;
-        let RecipientRecord::Fido(inner) = record else {
-            return Err(Error::RecipientIsNotManaged);
+        self.check_survivor(old, method, survivor)?;
+        self.keys
+            .retire(&self.application, old.record(method)?, interaction)
+    }
+    /// Deletes the stored factor named by the authenticated old envelope.
+    /// First publish and independently unlock a survivor with this method removed.
+    /// No old security key is needed; an already absent factor returns `Absent`.
+    /// Old copies depending on the factor also lose access.
+    pub fn remove_store_factor(
+        &self,
+        envelope: &Envelope,
+        method: MethodId,
+        survivor: &UnlockedKey,
+    ) -> Result<Removal> {
+        self.check_survivor(envelope, method, survivor)?;
+        let record = envelope.record(method)?;
+        let access = record
+            .method
+            .store_access()
+            .ok_or(Error::InvalidInput("method has no keystore factor"))?;
+        self.store.check_access(access)?;
+        // The survivor authenticates the complete reference. Requiring the old
+        // route to unlock would prevent cleanup after its key is lost or retired.
+        let secret = match self
+            .store
+            .load(self.application.as_str(), method.as_bytes(), access)
+        {
+            Ok(secret) => secret,
+            Err(StoreError::Missing) => return Ok(Removal::Absent),
+            Err(error) => return Err(error.into()),
         };
-        if inner.storage != FidoStorage::Managed {
-            return Err(Error::RecipientIsNotManaged);
+        Ok(self.store.remove(
+            self.application.as_str(),
+            method.as_bytes(),
+            access,
+            &secret,
+        )?)
+    }
+    fn check_survivor(
+        &self,
+        old: &Envelope,
+        removed: MethodId,
+        survivor: &UnlockedKey,
+    ) -> Result<()> {
+        self.check_key(survivor)?;
+        self.check_envelope(old)?;
+        old.record(removed)?;
+        survivor.authenticate(old)?;
+        if survivor.envelope.records.iter().any(|r| r.id == removed) {
+            return Err(Error::InvalidInput(
+                "remove the method from the surviving envelope first",
+            ));
         }
-        self.backend.verify_managed(
-            &ManagedRequest {
-                credential: CredentialBinding {
-                    application_id: &self.application_id,
-                    recipient_id: record.id(),
-                    credential_id: &inner.credential_id,
-                    public_key: &inner.public_key,
-                    policy: inner.policy,
-                    label: record.label(),
-                },
-                operation: Operation::VerifyManagedRecipient,
-            },
-            interaction,
-        )
+        Ok(())
     }
-
-    /// retires the exact managed credential from one selected authenticator.
-    ///
-    /// the complete envelope is authenticated before interaction. success
-    /// requires a verified deletion attempt and a complete absence check. the
-    /// envelope is not changed.
-    pub fn retire_managed_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        recipient: RecipientId,
-        interaction: &mut dyn Interaction,
-    ) -> Result<()> {
-        self.require_authenticated(envelope, root)?;
-        let record = envelope.find(recipient)?;
-        let RecipientRecord::Fido(inner) = record else {
-            return Err(Error::RecipientIsNotManaged);
-        };
-        if inner.storage != FidoStorage::Managed {
-            return Err(Error::RecipientIsNotManaged);
+    pub(crate) fn check_envelope(&self, envelope: &Envelope) -> Result<()> {
+        if envelope.application != self.application {
+            return Err(Error::WrongApplication);
         }
-        self.backend.retire_managed(
-            &ManagedRequest {
-                credential: CredentialBinding {
-                    application_id: &self.application_id,
-                    recipient_id: record.id(),
-                    credential_id: &inner.credential_id,
-                    public_key: &inner.public_key,
-                    policy: inner.policy,
-                    label: record.label(),
-                },
-                operation: Operation::RetireManagedRecipient,
-            },
-            interaction,
-        )
+        for record in &envelope.records {
+            self.check_method(record.method)?;
+        }
+        Ok(())
     }
-
-    /// replaces a recipient's passphrase while preserving its argon2 work.
-    pub fn rewrap_passphrase(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        recipient: RecipientId,
-        interaction: &mut dyn Interaction,
-    ) -> Result<()> {
-        self.require_application(envelope)?;
-        let parameters = envelope
-            .find(recipient)?
-            .passphrase_parameters()
-            .ok_or(Error::RecipientDoesNotUsePassphrase)?;
-        self.rewrap_passphrase_inner(envelope, root, recipient, parameters, interaction)
+    fn check_key(&self, key: &UnlockedKey) -> Result<()> {
+        self.check_envelope(&key.envelope)?;
+        key.envelope.verify(&key.root)
     }
-
-    /// replaces a recipient's passphrase using the supplied argon2id parameters.
-    pub fn rewrap_passphrase_with_parameters(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        recipient: RecipientId,
-        parameters: PassphraseParameters,
-        interaction: &mut dyn Interaction,
-    ) -> Result<()> {
-        self.rewrap_passphrase_inner(envelope, root, recipient, parameters, interaction)
+    fn check_method(&self, method: Method) -> Result<()> {
+        if self.allowed.as_ref().is_some_and(|a| !a.contains(&method)) {
+            return Err(Error::MethodNotAllowed);
+        }
+        Ok(())
     }
-
-    fn protect_root_for_operation(
-        &mut self,
-        root: &RootKey,
-        enrollment: Enrollment,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(KeyEnvelope, RecipientId)> {
-        self.admit_enrollment(&enrollment)?;
-        let envelope_id = random_array()?;
-        let envelope = KeyEnvelope {
-            application_id: self.application_id.clone(),
-            envelope_id,
-            recipients: Vec::new(),
-            mac: [0; ROOT_BYTES],
-        };
-        let (record, keys, managed) =
-            self.enroll_recipient(&envelope, root, enrollment, operation, interaction)?;
-        let id = record.id();
-        let envelope =
-            self.stage_enrollment(envelope, &record, root, &keys, managed, interaction)?;
-        Ok((envelope, id))
+    fn check_selected(&self, record: &Record) -> Result<()> {
+        if record
+            .kdf
+            .as_ref()
+            .is_some_and(|k| !k.cost.fits(self.max_cost))
+        {
+            return Err(Error::ResourceLimit);
+        }
+        if let Some(access) = record.method.store_access() {
+            self.store.check_access(access)?;
+        }
+        Ok(())
     }
-
-    fn protect_root_with_fido_and_local_secret_for_operation(
-        &mut self,
-        root: &RootKey,
-        label: impl Into<String>,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(KeyEnvelope, LocalSecretRecipient)> {
-        let label = validate_dedicated_label(label)?;
-        let envelope = KeyEnvelope {
-            application_id: self.application_id.clone(),
-            envelope_id: random_array()?,
-            recipients: Vec::new(),
-            mac: [0; ROOT_BYTES],
-        };
-        let (record, secret, key) =
-            self.enroll_fido_local_recipient(&envelope, root, label, operation, interaction)?;
-        let id = record.id();
-        let envelope =
-            Self::stage_record(envelope, record, root, &RecoveryKeys::FidoAndLocal(key))?;
-        Ok((envelope, LocalSecretRecipient::new(id, secret)))
+    fn check_enrollment(&self, request: &Enrollment) -> Result<()> {
+        self.check_method(request.method)?;
+        if request.method.needs_passphrase() && !request.cost.fits(self.max_cost) {
+            return Err(Error::ResourceLimit);
+        }
+        if let Some(access) = request.method.store_access() {
+            self.store.check_access(access)?;
+        }
+        Ok(())
     }
-
-    fn enroll_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        enrollment: Enrollment,
-        operation: Operation,
+    fn enroll(
+        &self,
+        base: &Envelope,
+        root: &[u8; 32],
+        request: &Enrollment,
+        replace: Option<MethodId>,
         interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys, Option<ManagedEnrollment>)> {
-        let result = match enrollment.policy {
-            RecipientPolicy::Passphrase => self.enroll_passphrase_recipient(
-                envelope,
-                root,
-                enrollment.label,
-                enrollment
-                    .parameters
-                    .ok_or(Error::InvalidPassphraseParameters)?,
-                operation,
-                interaction,
-            ),
-            RecipientPolicy::RecoverySecret | RecipientPolicy::FidoPresenceAndLocalSecret => {
-                Err(Error::InvalidEnvelope)
-            }
-            RecipientPolicy::Fido(policy) => self.enroll_fido_recipient(
-                envelope,
-                root,
-                enrollment.label,
-                policy,
-                operation,
-                interaction,
-            ),
-            RecipientPolicy::ManagedFido(policy) => {
-                return self.enroll_managed_fido_recipient(
-                    envelope,
-                    root,
-                    &enrollment.label,
-                    policy,
-                    operation,
-                    interaction,
+    ) -> Result<Envelope> {
+        self.check_enrollment(request)?;
+        let mut record = new_record(request)?;
+        let mut session = None;
+        let mut store_uncertain = false;
+        let result = (|| {
+            if request.method.key_options().is_some() {
+                session = Some(
+                    self.keys
+                        .enroll(&self.application, &mut record, interaction)?,
                 );
             }
-            RecipientPolicy::FidoAndPassphrase(policy) => self.enroll_combined_recipient(
-                envelope,
-                root,
-                enrollment.label,
-                policy,
-                enrollment
-                    .parameters
-                    .ok_or(Error::InvalidPassphraseParameters)?,
-                operation,
-                interaction,
-            ),
-        }?;
-        Ok((result.0, result.1, None))
-    }
-
-    fn enroll_passphrase_recipient(
-        &self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        label: String,
-        parameters: PassphraseParameters,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        let mut record = RecipientRecord::Passphrase(PassphraseRecipient {
-            id: Self::unique_recipient_id(envelope)?,
-            label,
-            kdf: KdfDescriptor {
-                parameters,
-                salt: Self::unique_salt(envelope)?,
-            },
-            passphrase_nonce: random_array()?,
-            wrapped_root: [0; WRAPPED_ROOT_BYTES],
-        });
-        let passphrase = request_new_passphrase(interaction, operation, record.label())?;
-        let key = crypto::derive_passphrase_key(
-            &record,
-            &self.application_id,
-            &envelope.envelope_id,
-            &passphrase,
-        )?;
-        drop(passphrase);
-        if let RecipientRecord::Passphrase(inner) = &mut record {
-            inner.wrapped_root = crypto::wrap_passphrase_root(
-                inner,
-                &self.application_id,
-                &envelope.envelope_id,
-                root,
-                &key,
-            )?;
-        }
-        Ok((record, RecoveryKeys::Passphrase(key)))
-    }
-
-    fn new_recovery_secret_record(
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        label: String,
-    ) -> Result<(RecipientRecord, RecoverySecret, DerivedKey)> {
-        let secret = RecoverySecret::random()?;
-        let mut record = RecipientRecord::RecoverySecret(RecoverySecretRecord {
-            id: Self::unique_recipient_id(envelope)?,
-            label,
-            recovery_nonce: random_array()?,
-            wrapped_root: [0; WRAPPED_ROOT_BYTES],
-        });
-        let RecipientRecord::RecoverySecret(inner) = &record else {
-            unreachable!("constructed recovery-secret record")
-        };
-        let key = crypto::derive_recovery_secret_key(
-            inner,
-            &envelope.application_id,
-            &envelope.envelope_id,
-            &secret,
-        )?;
-        if let RecipientRecord::RecoverySecret(inner) = &mut record {
-            inner.wrapped_root = crypto::wrap_recovery_secret_root(
-                inner,
-                &envelope.application_id,
-                &envelope.envelope_id,
-                root,
-                &key,
-            )?;
-        }
-        Ok((record, secret, key))
-    }
-
-    fn enroll_fido_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        label: String,
-        policy: crate::FidoPolicy,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        let credential =
-            self.backend
-                .enroll(&self.application_id, policy, &label, operation, interaction)?;
-        Self::validate_credential(envelope, &credential.credential_id)?;
-        let mut record = RecipientRecord::Fido(FidoRecipient {
-            id: Self::unique_recipient_id(envelope)?,
-            label,
-            credential_id: credential.credential_id,
-            public_key: credential.public_key,
-            policy,
-            storage: FidoStorage::NonDiscoverable,
-            prf_nonce: random_array()?,
-            fido_nonce: random_array()?,
-            wrapped_root: [0; WRAPPED_ROOT_BYTES],
-        });
-        let prf = self.evaluate(&record, envelope, operation, interaction)?;
-        let key =
-            crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
-        drop(prf);
-        if let RecipientRecord::Fido(inner) = &mut record {
-            inner.wrapped_root = crypto::wrap_fido_root(
-                inner,
-                &self.application_id,
-                &envelope.envelope_id,
-                root,
-                &key,
-            )?;
-        }
-        Ok((record, RecoveryKeys::Fido(key)))
-    }
-
-    fn enroll_fido_local_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        label: String,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, LocalSecret, DerivedKey)> {
-        let id = Self::unique_recipient_id(envelope)?;
-        let secret = LocalSecret::random()?;
-        let prf_nonce = random_array()?;
-        let wrap_nonce = random_array()?;
-        let credential = self.backend.enroll(
-            &self.application_id,
-            crate::FidoPolicy::Presence,
-            &label,
-            operation,
-            interaction,
-        )?;
-        Self::validate_credential(envelope, &credential.credential_id)?;
-        let mut record = RecipientRecord::FidoAndLocalSecret(FidoAndLocalSecretRecipient {
-            id,
-            label,
-            credential_id: credential.credential_id,
-            public_key: credential.public_key,
-            prf_nonce,
-            wrap_nonce,
-            wrapped_root: [0; WRAPPED_ROOT_BYTES],
-        });
-        let prf = self.evaluate(&record, envelope, operation, interaction)?;
-        let RecipientRecord::FidoAndLocalSecret(inner) = &mut record else {
-            unreachable!("constructed fido-and-local-secret record")
-        };
-        let key = crypto::derive_fido_local_key(
-            inner,
-            &self.application_id,
-            &envelope.envelope_id,
-            &prf,
-            &secret,
-        )?;
-        drop(prf);
-        inner.wrapped_root = crypto::wrap_fido_local_root(
-            inner,
-            &self.application_id,
-            &envelope.envelope_id,
-            root,
-            &key,
-        )?;
-        Ok((record, secret, key))
-    }
-
-    fn enroll_managed_fido_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        label: &str,
-        policy: crate::FidoPolicy,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys, Option<ManagedEnrollment>)> {
-        let id = Self::unique_recipient_id(envelope)?;
-        let mut enrollment = self.backend.enroll_managed(
-            &self.application_id,
-            id,
-            policy,
-            label,
-            operation,
-            interaction,
-        )?;
-        let result = self.finish_managed_fido_recipient(
-            envelope,
-            root,
-            id,
-            label,
-            policy,
-            operation,
-            &mut enrollment,
-            interaction,
-        );
-        match result {
-            Ok(result) => Ok((result.0, result.1, Some(enrollment))),
-            Err(error) => Err(self.cleanup_failed_managed_enrollment(
-                &mut enrollment,
-                id,
-                label,
-                error,
-                interaction,
-            )),
-        }
-    }
-
-    fn cleanup_failed_managed_enrollment(
-        &mut self,
-        enrollment: &mut ManagedEnrollment,
-        recipient_id: RecipientId,
-        label: &str,
-        original_error: Error,
-        interaction: &mut dyn Interaction,
-    ) -> Error {
-        let credential_id = enrollment.credential.credential_id.clone();
-        let public_key = enrollment.credential.public_key.clone();
-        match self.backend.cleanup_managed_enrollment(
-            enrollment,
-            &ManagedRequest {
-                credential: CredentialBinding {
-                    application_id: &self.application_id,
-                    recipient_id,
-                    credential_id: &credential_id,
-                    public_key: &public_key,
-                    policy: enrollment.policy,
-                    label,
-                },
-                operation: Operation::RetireManagedRecipient,
-            },
-            interaction,
-        ) {
-            Ok(()) => original_error,
-            Err(_) => AuthenticatorFailure::CredentialMayRemain.into(),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn finish_managed_fido_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        id: RecipientId,
-        label: &str,
-        policy: crate::FidoPolicy,
-        operation: Operation,
-        enrollment: &mut ManagedEnrollment,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        Self::validate_credential(envelope, &enrollment.credential.credential_id)?;
-        let mut record = RecipientRecord::Fido(FidoRecipient {
-            id,
-            label: label.to_owned(),
-            credential_id: enrollment.credential.credential_id.clone(),
-            public_key: enrollment.credential.public_key.clone(),
-            policy,
-            storage: FidoStorage::Managed,
-            prf_nonce: random_array()?,
-            fido_nonce: random_array()?,
-            wrapped_root: [0; WRAPPED_ROOT_BYTES],
-        });
-        let input = crypto::prf_input(&record, &self.application_id, &envelope.envelope_id)?;
-        let RecipientRecord::Fido(inner) = &record else {
-            unreachable!("constructed managed FIDO record")
-        };
-        let prf_request = PrfRequest {
-            credential: CredentialBinding {
-                application_id: &self.application_id,
-                recipient_id: id,
-                credential_id: &inner.credential_id,
-                public_key: &inner.public_key,
-                policy: inner.policy,
-                label,
-            },
-            input: &input,
-            operation,
-        };
-        let prf =
-            self.backend
-                .evaluate_managed_enrollment(enrollment, &prf_request, interaction)?;
-        let key =
-            crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
-        drop(prf);
-        if let RecipientRecord::Fido(inner) = &mut record {
-            inner.wrapped_root = crypto::wrap_fido_root(
-                inner,
-                &self.application_id,
-                &envelope.envelope_id,
-                root,
-                &key,
-            )?;
-        }
-        Ok((record, RecoveryKeys::Fido(key)))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn enroll_combined_recipient(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        label: String,
-        policy: crate::FidoPolicy,
-        parameters: PassphraseParameters,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        let credential =
-            self.backend
-                .enroll(&self.application_id, policy, &label, operation, interaction)?;
-        Self::validate_credential(envelope, &credential.credential_id)?;
-        let mut record = RecipientRecord::FidoAndPassphrase(FidoAndPassphraseRecipient {
-            id: Self::unique_recipient_id(envelope)?,
-            label,
-            credential_id: credential.credential_id,
-            public_key: credential.public_key,
-            policy,
-            prf_nonce: random_array()?,
-            fido_nonce: random_array()?,
-            kdf: KdfDescriptor {
-                parameters,
-                salt: Self::unique_salt(envelope)?,
-            },
-            passphrase_nonce: random_array()?,
-            wrapped_root: [0; COMBINED_WRAPPED_ROOT_BYTES],
-        });
-        let prf = self.evaluate(&record, envelope, operation, interaction)?;
-        let fido_key =
-            crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
-        drop(prf);
-        let passphrase = request_new_passphrase(interaction, operation, record.label())?;
-        let passphrase_key = crypto::derive_passphrase_key(
-            &record,
-            &self.application_id,
-            &envelope.envelope_id,
-            &passphrase,
-        )?;
-        drop(passphrase);
-        if let RecipientRecord::FidoAndPassphrase(inner) = &mut record {
-            inner.wrapped_root = crypto::wrap_combined_root(
-                inner,
-                &self.application_id,
-                &envelope.envelope_id,
-                root,
-                &passphrase_key,
-                &fido_key,
-            )?;
-        }
-        Ok((
-            record,
-            RecoveryKeys::Combined {
-                passphrase: passphrase_key,
-                fido: fido_key,
-            },
-        ))
-    }
-
-    fn rewrap_passphrase_inner(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        recipient: RecipientId,
-        parameters: PassphraseParameters,
-        interaction: &mut dyn Interaction,
-    ) -> Result<()> {
-        self.require_application(envelope)?;
-        let current = envelope.find(recipient)?.clone();
-        if !current.policy().uses_passphrase() {
-            return Err(Error::RecipientDoesNotUsePassphrase);
-        }
-        crypto::verify_envelope_mac(envelope, root)?;
-        self.admit_parameters(parameters)?;
-
-        let (replacement, keys) = match &current {
-            RecipientRecord::Passphrase(old) => {
-                self.rewrap_passphrase_record(envelope, root, old, parameters, interaction)?
-            }
-            RecipientRecord::RecoverySecret(_) | RecipientRecord::FidoAndLocalSecret(_) => {
-                return Err(Error::RecipientDoesNotUsePassphrase);
-            }
-            RecipientRecord::Fido(_) => return Err(Error::RecipientDoesNotUsePassphrase),
-            RecipientRecord::FidoAndPassphrase(old) => {
-                self.rewrap_combined_record(envelope, root, old, parameters, interaction)?
-            }
-        };
-
-        let mut staged = envelope.clone();
-        let index = staged
-            .recipients
-            .binary_search_by_key(&recipient, RecipientRecord::id)
-            .map_err(|_| Error::RecipientNotFound)?;
-        staged.recipients[index] = replacement;
-        let staged = Self::stage_existing_record(staged, recipient, root, &keys)?;
-        *envelope = staged;
-        Ok(())
-    }
-
-    fn rewrap_passphrase_record(
-        &self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        old: &PassphraseRecipient,
-        parameters: PassphraseParameters,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        let mut replacement = RecipientRecord::Passphrase(PassphraseRecipient {
-            id: old.id,
-            label: old.label.clone(),
-            kdf: KdfDescriptor {
-                parameters,
-                salt: Self::unique_salt(envelope)?,
-            },
-            passphrase_nonce: fresh_array(&old.passphrase_nonce)?,
-            wrapped_root: [0; WRAPPED_ROOT_BYTES],
-        });
-        let passphrase = request_new_passphrase(
-            interaction,
-            Operation::RewrapPassphrase,
-            replacement.label(),
-        )?;
-        let key = crypto::derive_passphrase_key(
-            &replacement,
-            &self.application_id,
-            &envelope.envelope_id,
-            &passphrase,
-        )?;
-        drop(passphrase);
-        if let RecipientRecord::Passphrase(inner) = &mut replacement {
-            inner.wrapped_root = crypto::wrap_passphrase_root(
-                inner,
-                &self.application_id,
-                &envelope.envelope_id,
-                root,
-                &key,
-            )?;
-        }
-        Ok((replacement, RecoveryKeys::Passphrase(key)))
-    }
-
-    fn rewrap_combined_record(
-        &mut self,
-        envelope: &KeyEnvelope,
-        root: &RootKey,
-        old: &FidoAndPassphraseRecipient,
-        parameters: PassphraseParameters,
-        interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        let mut replacement = RecipientRecord::FidoAndPassphrase(FidoAndPassphraseRecipient {
-            id: old.id,
-            label: old.label.clone(),
-            credential_id: old.credential_id.clone(),
-            public_key: old.public_key.clone(),
-            policy: old.policy,
-            prf_nonce: fresh_array(&old.prf_nonce)?,
-            fido_nonce: fresh_array(&old.fido_nonce)?,
-            kdf: KdfDescriptor {
-                parameters,
-                salt: Self::unique_salt(envelope)?,
-            },
-            passphrase_nonce: fresh_array(&old.passphrase_nonce)?,
-            wrapped_root: [0; COMBINED_WRAPPED_ROOT_BYTES],
-        });
-        let prf = self.evaluate(
-            &replacement,
-            envelope,
-            Operation::RewrapPassphrase,
-            interaction,
-        )?;
-        let fido_key = crypto::derive_fido_key(
-            &replacement,
-            &self.application_id,
-            &envelope.envelope_id,
-            &prf,
-        )?;
-        drop(prf);
-        let passphrase = request_new_passphrase(
-            interaction,
-            Operation::RewrapPassphrase,
-            replacement.label(),
-        )?;
-        let passphrase_key = crypto::derive_passphrase_key(
-            &replacement,
-            &self.application_id,
-            &envelope.envelope_id,
-            &passphrase,
-        )?;
-        drop(passphrase);
-        if let RecipientRecord::FidoAndPassphrase(inner) = &mut replacement {
-            inner.wrapped_root = crypto::wrap_combined_root(
-                inner,
-                &self.application_id,
-                &envelope.envelope_id,
-                root,
-                &passphrase_key,
-                &fido_key,
-            )?;
-        }
-        Ok((
-            replacement,
-            RecoveryKeys::Combined {
-                passphrase: passphrase_key,
-                fido: fido_key,
-            },
-        ))
-    }
-
-    fn stage_enrollment(
-        &mut self,
-        envelope: KeyEnvelope,
-        record: &RecipientRecord,
-        root: &RootKey,
-        keys: &RecoveryKeys,
-        mut managed: Option<ManagedEnrollment>,
-        interaction: &mut dyn Interaction,
-    ) -> Result<KeyEnvelope> {
-        match Self::stage_record(envelope, record.clone(), root, keys) {
-            Ok(envelope) => Ok(envelope),
-            Err(error) => {
-                let Some(enrollment) = &mut managed else {
-                    return Err(error);
-                };
-                if !matches!(
-                    record,
-                    RecipientRecord::Fido(FidoRecipient {
-                        storage: FidoStorage::Managed,
-                        ..
-                    })
-                ) {
-                    return Err(Error::AuthenticatorResponseInvalid);
-                }
-                Err(self.cleanup_failed_managed_enrollment(
-                    enrollment,
-                    record.id(),
-                    record.label(),
-                    error,
+            let context = record.context(&self.application, &base.id);
+            let key_factor = session
+                .as_mut()
+                .map(|s| s.evaluate(&self.application, &record, &context, interaction))
+                .transpose()?;
+            let password = if request.method.needs_passphrase() {
+                Some(password_key(
+                    &record,
+                    &context,
+                    Operation::Enroll,
                     interaction,
-                ))
+                )?)
+            } else {
+                None
+            };
+            let store_secret = if request.method.store_access().is_some() {
+                Some(StoreSecret::import(&mut *crypto::random()?))
+            } else {
+                None
+            };
+            let store_key = store_secret
+                .as_ref()
+                .map(|s| s.expose(|b| crypto::factor(b, &context, b"keystore")));
+            let recovery = if request.method == Method::RecoverySecret {
+                let secret = interaction.recovery_secret(prompt(&record, Operation::Enroll))?;
+                Some(crypto::factor(secret.0.as_slice(), &context, b"recovery"))
+            } else {
+                None
+            };
+            let wrap_key = match request.method {
+                Method::Passphrase => password.as_ref().expect("password"),
+                Method::SecurityKey(_) | Method::KeyAndPassphrase(_) => {
+                    key_factor.as_ref().expect("key")
+                }
+                Method::Keystore(_) => store_key.as_ref().expect("store"),
+                Method::RecoverySecret => recovery.as_ref().expect("recovery"),
+                Method::KeyAndKeystore(_, _) => &crypto::combine(
+                    key_factor.as_ref().expect("key"),
+                    store_key.as_ref().expect("store"),
+                    &context,
+                ),
+            };
+            let inner = if let Some(password) = password
+                .as_ref()
+                .filter(|_| matches!(request.method, Method::KeyAndPassphrase(_)))
+            {
+                crypto::wrap(password, &record.nonce, &context, root)?
+            } else {
+                root.to_vec()
+            };
+            let inner = Zeroizing::new(inner);
+            record.wrapped = crypto::wrap(wrap_key, &record.nonce, &context, &inner)?;
+            // Build and validate the complete result before the final store write.
+            let mut next = base.clone();
+            next.records.retain(|r| Some(r.id) != replace);
+            next.records.push(record.clone());
+            next.sign(root);
+            Envelope::from_bytes(&next.to_bytes())?.verify(root)?;
+            if let (Some(access), Some(secret)) = (request.method.store_access(), store_secret) {
+                if let Err(error) = self.store.create(
+                    self.application.as_str(),
+                    record.id.as_bytes(),
+                    access,
+                    &secret,
+                ) {
+                    store_uncertain = error == StoreError::StateUncertain;
+                    return Err(error.into());
+                }
+            }
+            Ok(next)
+        })();
+        match result {
+            Ok(next) => Ok(next),
+            Err(error) => {
+                let cleanup_failed = session.as_mut().is_some_and(|s| {
+                    s.cleanup(&error, prompt(&record, Operation::Enroll), interaction)
+                        .is_err()
+                });
+                if store_uncertain || cleanup_failed {
+                    Err(Error::EnrollmentUncertain {
+                        method: record.id,
+                        cause: Box::new(error),
+                    })
+                } else {
+                    Err(error)
+                }
             }
         }
     }
-
-    fn stage_record(
-        mut staged: KeyEnvelope,
-        record: RecipientRecord,
-        root: &RootKey,
-        keys: &RecoveryKeys,
-    ) -> Result<KeyEnvelope> {
-        let recipient = record.id();
-        staged.recipients.push(record);
-        staged.recipients.sort_by_key(RecipientRecord::id);
-        Self::stage_existing_record(staged, recipient, root, keys)
-    }
-
-    fn stage_existing_record(
-        mut staged: KeyEnvelope,
-        recipient: RecipientId,
-        root: &RootKey,
-        keys: &RecoveryKeys,
-    ) -> Result<KeyEnvelope> {
-        staged.mac = crypto::compute_envelope_mac(&staged, root)?;
-        let staged = canonicalize(&staged)?;
-        #[cfg(test)]
-        let staged = {
-            let mut staged = staged;
-            if take_staged_fault(StagedFault::EnvelopeMac) {
-                staged.mac[0] ^= 1;
-            }
-            staged
-        };
-        let recovered = recover_with_keys(
-            staged.find(recipient)?,
-            &staged.application_id,
-            &staged.envelope_id,
-            keys,
-        )?;
-        #[cfg(test)]
-        let recovered = if take_staged_fault(StagedFault::RootMismatch) {
-            let mut wrong = zeroize::Zeroizing::new(root.expose(|bytes| *bytes));
-            wrong[0] ^= 1;
-            RootKey::from_zeroizing(wrong)
+    fn unwrap(
+        &self,
+        envelope: &Envelope,
+        record: &Record,
+        interaction: &mut dyn Interaction,
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        let context = record.context(&self.application, &envelope.id);
+        let key_factor = if record.method.key_options().is_some() {
+            Some(
+                self.keys
+                    .evaluate(&self.application, record, &context, interaction)?,
+            )
         } else {
-            recovered
+            None
         };
-        if !roots_match(root, &recovered) || !crypto::envelope_mac_matches(&staged, &recovered)? {
+        // Authenticate the outer key layer before asking for a combined password.
+        let inner = if matches!(record.method, Method::KeyAndPassphrase(_)) {
+            Some(crypto::unwrap(
+                key_factor.as_ref().expect("key"),
+                &record.nonce,
+                &context,
+                &record.wrapped,
+            )?)
+        } else {
+            None
+        };
+        let password = if record.method.needs_passphrase() {
+            Some(password_key(
+                record,
+                &context,
+                Operation::Unlock,
+                interaction,
+            )?)
+        } else {
+            None
+        };
+        let store_secret = record
+            .method
+            .store_access()
+            .map(|a| {
+                self.store
+                    .load(self.application.as_str(), record.id.as_bytes(), a)
+            })
+            .transpose()?;
+        let store_key = store_secret
+            .as_ref()
+            .map(|s| s.expose(|b| crypto::factor(b, &context, b"keystore")));
+        let recovery = if record.method == Method::RecoverySecret {
+            let secret = interaction.recovery_secret(prompt(record, Operation::Unlock))?;
+            Some(crypto::factor(secret.0.as_slice(), &context, b"recovery"))
+        } else {
+            None
+        };
+        let wrapping_key = match record.method {
+            Method::Passphrase | Method::KeyAndPassphrase(_) => {
+                password.as_ref().expect("password")
+            }
+            Method::SecurityKey(_) => key_factor.as_ref().expect("key"),
+            Method::Keystore(_) => store_key.as_ref().expect("store"),
+            Method::RecoverySecret => recovery.as_ref().expect("recovery"),
+            Method::KeyAndKeystore(_, _) => &crypto::combine(
+                key_factor.as_ref().expect("key"),
+                store_key.as_ref().expect("store"),
+                &context,
+            ),
+        };
+        let plain = crypto::unwrap(
+            wrapping_key,
+            &record.nonce,
+            &context,
+            inner
+                .as_deref()
+                .map_or(record.wrapped.as_slice(), Vec::as_slice),
+        )?;
+        let mut root = Zeroizing::new([0; 32]);
+        if plain.len() != root.len() {
             return Err(Error::UnlockFailed);
         }
-        Ok(staged)
-    }
-
-    fn evaluate(
-        &mut self,
-        record: &RecipientRecord,
-        envelope: &KeyEnvelope,
-        operation: Operation,
-        interaction: &mut dyn Interaction,
-    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
-        let (credential_id, public_key, policy) = match record {
-            RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_) => {
-                return Err(Error::InvalidEnvelope);
-            }
-            RecipientRecord::Fido(inner) => (&inner.credential_id, &inner.public_key, inner.policy),
-            RecipientRecord::FidoAndPassphrase(inner) => {
-                (&inner.credential_id, &inner.public_key, inner.policy)
-            }
-            RecipientRecord::FidoAndLocalSecret(inner) => (
-                &inner.credential_id,
-                &inner.public_key,
-                crate::FidoPolicy::Presence,
-            ),
-        };
-        let input = crypto::prf_input(record, &self.application_id, &envelope.envelope_id)?;
-        let request = PrfRequest {
-            credential: CredentialBinding {
-                application_id: &self.application_id,
-                recipient_id: record.id(),
-                credential_id,
-                public_key,
-                policy,
-                label: record.label(),
-            },
-            input: &input,
-            operation,
-        };
-        self.backend.evaluate(&request, interaction)
-    }
-
-    fn require_application(&self, envelope: &KeyEnvelope) -> Result<()> {
-        if envelope.application_id == self.application_id {
-            Ok(())
-        } else {
-            Err(Error::ApplicationMismatch)
-        }
-    }
-
-    fn require_authenticated(&self, envelope: &KeyEnvelope, root: &RootKey) -> Result<()> {
-        self.require_application(envelope)?;
-        crypto::verify_envelope_mac(envelope, root)
-    }
-
-    fn admit_enrollment(&self, enrollment: &Enrollment) -> Result<()> {
-        if let Some(parameters) = enrollment.parameters {
-            self.admit_parameters(parameters)?;
-        }
-        Ok(())
-    }
-
-    fn admit_record(&self, record: &RecipientRecord) -> Result<()> {
-        if let Some(parameters) = record.passphrase_parameters() {
-            self.admit_parameters(parameters)?;
-        }
-        Ok(())
-    }
-
-    fn admit_parameters(&self, parameters: PassphraseParameters) -> Result<()> {
-        if self.passphrase_limits.accepts(parameters) {
-            Ok(())
-        } else {
-            Err(Error::PassphraseLimitExceeded)
-        }
-    }
-
-    fn unique_recipient_id(envelope: &KeyEnvelope) -> Result<RecipientId> {
-        for _ in 0..RANDOM_ATTEMPTS {
-            let id = RecipientId::from_bytes(random_array()?);
-            if envelope.find(id).is_err() {
-                return Ok(id);
-            }
-        }
-        Err(Error::RandomUnavailable)
-    }
-
-    fn unique_salt(envelope: &KeyEnvelope) -> Result<[u8; 16]> {
-        for _ in 0..RANDOM_ATTEMPTS {
-            let salt = random_array()?;
-            let duplicate = envelope.recipients.iter().any(|record| match record {
-                RecipientRecord::Passphrase(inner) => inner.kdf.salt == salt,
-                RecipientRecord::RecoverySecret(_)
-                | RecipientRecord::Fido(_)
-                | RecipientRecord::FidoAndLocalSecret(_) => false,
-                RecipientRecord::FidoAndPassphrase(inner) => inner.kdf.salt == salt,
-            });
-            if !duplicate {
-                return Ok(salt);
-            }
-        }
-        Err(Error::RandomUnavailable)
-    }
-
-    fn validate_credential(envelope: &KeyEnvelope, credential_id: &[u8]) -> Result<()> {
-        if credential_id.is_empty()
-            || credential_id.len() > MAX_CREDENTIAL_ID
-            || envelope.recipients.iter().any(|record| match record {
-                RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_) => false,
-                RecipientRecord::Fido(inner) => inner.credential_id == credential_id,
-                RecipientRecord::FidoAndPassphrase(inner) => inner.credential_id == credential_id,
-                RecipientRecord::FidoAndLocalSecret(inner) => inner.credential_id == credential_id,
-            })
-        {
-            return Err(Error::AuthenticatorResponseInvalid);
-        }
-        Ok(())
-    }
-
-    #[cfg(any(feature = "testing", test))]
-    pub(crate) fn fake(application_id: ApplicationId) -> Self {
-        Self {
-            application_id,
-            passphrase_limits: PassphraseLimits::DESKTOP,
-            backend: AuthenticatorBackend::fake(),
-        }
-    }
-
-    #[cfg(any(feature = "testing", test))]
-    pub(crate) fn fake_backend_mut(&mut self) -> &mut crate::backend::fake::FakeBackend {
-        self.backend.fake_mut()
+        root.copy_from_slice(&plain);
+        Ok(root)
     }
 }
-
-enum RecoveryKeys {
-    Passphrase(DerivedKey),
-    Recovery(DerivedKey),
-    Fido(DerivedKey),
-    FidoAndLocal(DerivedKey),
-    Combined {
-        passphrase: DerivedKey,
-        fido: DerivedKey,
-    },
-}
-
-fn recover_with_keys(
-    record: &RecipientRecord,
-    application_id: &ApplicationId,
-    envelope_id: &[u8; 32],
-    keys: &RecoveryKeys,
-) -> Result<RootKey> {
-    match (record, keys) {
-        (RecipientRecord::Passphrase(record), RecoveryKeys::Passphrase(key)) => {
-            crypto::unwrap_passphrase_root(record, application_id, envelope_id, key)
-        }
-        (RecipientRecord::RecoverySecret(record), RecoveryKeys::Recovery(key)) => {
-            crypto::unwrap_recovery_secret_root(record, application_id, envelope_id, key)
-        }
-        (RecipientRecord::Fido(record), RecoveryKeys::Fido(key)) => {
-            crypto::unwrap_fido_root(record, application_id, envelope_id, key)
-        }
-        (RecipientRecord::FidoAndLocalSecret(record), RecoveryKeys::FidoAndLocal(key)) => {
-            crypto::unwrap_fido_local_root(record, application_id, envelope_id, key)
-        }
-        (
-            RecipientRecord::FidoAndPassphrase(record),
-            RecoveryKeys::Combined { passphrase, fido },
-        ) => {
-            let inner = crypto::unwrap_combined_outer(record, application_id, envelope_id, fido)?;
-            crypto::unwrap_combined_inner(record, application_id, envelope_id, &inner, passphrase)
-        }
-        _ => Err(Error::InvalidEnvelope),
-    }
-}
-
-fn validate_dedicated_label(label: impl Into<String>) -> Result<String> {
-    let label = label.into();
-    validate_label(&label).map_err(|()| Error::InvalidLabel)?;
-    Ok(label)
-}
-
-fn request_passphrase(
-    interaction: &mut dyn Interaction,
+fn password_key(
+    record: &Record,
+    context: &[u8; 32],
     operation: Operation,
-    label: &str,
-    purpose: PassphrasePurpose,
-) -> Result<Passphrase> {
-    interaction
-        .request_passphrase(&PassphrasePrompt::new(operation, label, purpose))
-        .map_err(Error::from)
-}
-
-fn request_new_passphrase(
     interaction: &mut dyn Interaction,
-    operation: Operation,
-    label: &str,
-) -> Result<Passphrase> {
-    let passphrase = request_passphrase(interaction, operation, label, PassphrasePurpose::New)?;
-    let confirmation =
-        request_passphrase(interaction, operation, label, PassphrasePurpose::Confirm)?;
-    if !passphrase.confirmation_matches(&confirmation) {
-        return Err(Error::PassphraseConfirmationMismatch);
-    }
-    drop(confirmation);
-    Ok(passphrase)
-}
-
-fn canonicalize(envelope: &KeyEnvelope) -> Result<KeyEnvelope> {
-    let encoded = envelope.encode();
-    #[cfg(test)]
-    let encoded = {
-        let mut encoded = encoded;
-        if take_staged_fault(StagedFault::CanonicalDecode) {
-            encoded.push(0);
-        }
-        encoded
+) -> Result<Zeroizing<[u8; 32]>> {
+    let prompt = prompt(record, operation);
+    let purpose = if operation == Operation::Enroll {
+        PassphrasePurpose::New
+    } else {
+        PassphrasePurpose::Unlock
     };
-    KeyEnvelope::decode(&encoded)
+    let password = interaction.passphrase(prompt, purpose)?;
+    if operation == Operation::Enroll
+        && !password.matches(&interaction.passphrase(prompt, PassphrasePurpose::Confirm)?)
+    {
+        return Err(Error::ConfirmationMismatch);
+    }
+    let kdf = record.kdf.as_ref().expect("password recipe");
+    let value = crypto::passphrase(&password, &kdf.salt, kdf.cost)?;
+    Ok(crypto::factor(value.as_slice(), context, b"passphrase"))
 }
 
-fn roots_match(left: &RootKey, right: &RootKey) -> bool {
-    bool::from(left.bytes().ct_eq(right.bytes()))
-}
-
-fn random_array<const N: usize>() -> Result<[u8; N]> {
-    let mut bytes = [0; N];
-    getrandom::fill(&mut bytes).map_err(|_| Error::RandomUnavailable)?;
-    Ok(bytes)
-}
-
-fn fresh_array<const N: usize>(old: &[u8; N]) -> Result<[u8; N]> {
-    for _ in 0..RANDOM_ATTEMPTS {
-        let value = random_array()?;
-        if &value != old {
-            return Ok(value);
-        }
-    }
-    Err(Error::RandomUnavailable)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-
-    use super::*;
-    use crate::{AuthenticatorFailure, FidoPolicy, InteractionError, Pin};
-
-    struct ScriptedInteraction {
-        passphrases: VecDeque<Vec<u8>>,
-        events: Vec<&'static str>,
-        touch_policies: Vec<FidoPolicy>,
-    }
-
-    impl ScriptedInteraction {
-        fn new(values: &[&[u8]]) -> Self {
-            Self {
-                passphrases: values.iter().map(|value| value.to_vec()).collect(),
-                events: Vec::new(),
-                touch_policies: Vec::new(),
-            }
-        }
-    }
-
-    impl Interaction for ScriptedInteraction {
-        fn request_passphrase(
-            &mut self,
-            prompt: &PassphrasePrompt,
-        ) -> std::result::Result<Passphrase, InteractionError> {
-            self.events.push(match prompt.purpose() {
-                PassphrasePurpose::Unlock => "unlock passphrase",
-                PassphrasePurpose::New => "new passphrase",
-                PassphrasePurpose::Confirm => "confirm passphrase",
-            });
-            Passphrase::new(
-                self.passphrases
-                    .pop_front()
-                    .ok_or(InteractionError::Failed)?,
-            )
-            .map_err(|_| InteractionError::Failed)
-        }
-
-        fn request_pin(
-            &mut self,
-            _prompt: &crate::PinPrompt,
-        ) -> std::result::Result<Pin, InteractionError> {
-            self.events.push("pin");
-            Pin::new("123456".to_owned()).map_err(|_| InteractionError::Failed)
-        }
-
-        fn touch_required(
-            &mut self,
-            prompt: &crate::TouchPrompt,
-        ) -> std::result::Result<(), InteractionError> {
-            self.touch_policies.push(prompt.policy());
-            self.events.push(match prompt.ceremony() {
-                crate::FidoCeremony::Enrollment => "enrollment touch",
-                crate::FidoCeremony::Assertion => "assertion touch",
-            });
-            Ok(())
-        }
-    }
-
-    struct CancelledInteraction;
-
-    impl Interaction for CancelledInteraction {
-        fn request_passphrase(
-            &mut self,
-            _prompt: &PassphrasePrompt,
-        ) -> std::result::Result<Passphrase, InteractionError> {
-            Err(InteractionError::Cancelled)
-        }
-    }
-
-    struct UnsupportedInteraction;
-
-    impl Interaction for UnsupportedInteraction {}
-
-    fn application() -> ApplicationId {
-        ApplicationId::new("org.example.protector-test").unwrap()
-    }
-
-    fn test_parameters() -> PassphraseParameters {
-        PassphraseParameters::new(65_536, 3, 1).unwrap()
-    }
-
-    fn enrollment(label: &str) -> Enrollment {
-        Enrollment::passphrase_with_parameters(label, test_parameters()).unwrap()
-    }
-
-    #[test]
-    fn passphrase_lifecycle_is_transactional() {
-        crypto::reset_passphrase_derivations();
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut interaction = ScriptedInteraction::new(&[b"first", b"first"]);
-        let (root, mut envelope, first) = protector
-            .create_root(enrollment("first"), &mut interaction)
-            .unwrap();
-        assert_eq!(crypto::passphrase_derivations(), 1);
-
-        crypto::reset_passphrase_derivations();
-        let mut open = ScriptedInteraction::new(&[b"first"]);
-        let recovered = protector.unlock(&envelope, first, &mut open).unwrap();
-        assert!(roots_match(&root, &recovered));
-        assert_eq!(crypto::passphrase_derivations(), 1);
-
-        let mut add = ScriptedInteraction::new(&[b"second", b"second"]);
-        let second = protector
-            .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
-            .unwrap();
-        protector
-            .remove_recipient(&mut envelope, &root, first)
-            .unwrap();
-        assert_eq!(envelope.recipients().len(), 1);
-        assert_eq!(envelope.recipients()[0].id(), second);
-
-        let before = envelope.encode();
-        let mut wrong = ScriptedInteraction::new(&[b"wrong"]);
-        assert!(matches!(
-            protector.unlock(&envelope, second, &mut wrong),
-            Err(Error::UnlockFailed)
-        ));
-        assert_eq!(envelope.encode(), before);
-    }
-
-    #[test]
-    fn recovery_secret_lifecycle_is_noninteractive_and_transactional() {
-        let mut protector = KeyProtector::new(application());
-        let (root, mut envelope, recovery) = protector
-            .create_root_with_recovery_secret("recovery")
-            .unwrap();
-        let recipient = recovery.recipient_id();
-        assert_eq!(
-            envelope.recipients()[0].policy(),
-            RecipientPolicy::RecoverySecret
-        );
-
-        let encoded = envelope.encode();
-        recovery.secret().expose(|secret| {
-            assert!(!encoded.windows(secret.len()).any(|window| window == secret));
-        });
-
-        let recovered = protector
-            .unlock_with_recovery_secret(&envelope, recipient, recovery.secret())
-            .unwrap();
-        assert!(roots_match(&root, &recovered));
-
-        let mut exported = recovery.secret().expose(|secret| *secret);
-        let imported = RecoverySecret::import(&mut exported);
-        assert_eq!(exported, [0; 32]);
-        let recovered = protector
-            .unlock_with_recovery_secret(&envelope, recipient, &imported)
-            .unwrap();
-        assert!(roots_match(&root, &recovered));
-
-        let mut wrong_bytes = [0x81; 32];
-        let wrong = RecoverySecret::import(&mut wrong_bytes);
-        assert!(matches!(
-            protector.unlock_with_recovery_secret(&envelope, recipient, &wrong),
-            Err(Error::UnlockFailed)
-        ));
-
-        let mut no_interaction = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut no_interaction),
-            Err(Error::UnlockFailed)
-        ));
-        assert!(no_interaction.events.is_empty());
-
-        let second = protector
-            .add_recovery_secret(&mut envelope, &root, "second recovery")
-            .unwrap();
-        assert_eq!(envelope.recipients().len(), 2);
-        protector
-            .remove_recipient(&mut envelope, &root, recipient)
-            .unwrap();
-        let recovered = protector
-            .unlock_with_recovery_secret(&envelope, second.recipient_id(), second.secret())
-            .unwrap();
-        assert!(roots_match(&root, &recovered));
-    }
-
-    #[test]
-    fn recovery_secret_binds_context_and_failed_additions_do_not_publish() {
-        let protector = KeyProtector::new(application());
-        let (root, envelope, recovery) = protector
-            .create_root_with_recovery_secret("recovery")
-            .unwrap();
-
-        for mutate in [
-            |record: &mut RecoverySecretRecord| record.label.push('x'),
-            |record: &mut RecoverySecretRecord| record.recovery_nonce[0] ^= 1,
-            |record: &mut RecoverySecretRecord| record.wrapped_root[0] ^= 1,
-        ] {
-            let mut hostile = envelope.clone();
-            let RecipientRecord::RecoverySecret(record) = &mut hostile.recipients[0] else {
-                panic!("fixture must contain a recovery-secret recipient");
-            };
-            mutate(record);
-            assert!(matches!(
-                protector.unlock_with_recovery_secret(
-                    &hostile,
-                    recovery.recipient_id(),
-                    recovery.secret(),
-                ),
-                Err(Error::UnlockFailed)
-            ));
-        }
-
-        let absent = RecipientId::from_bytes([0x7a; 32]);
-        assert!(matches!(
-            protector.unlock_with_recovery_secret(&envelope, absent, recovery.secret()),
-            Err(Error::UnlockFailed)
-        ));
-
-        let mut hostile = envelope.clone();
-        hostile.envelope_id[0] ^= 1;
-        assert!(matches!(
-            protector.unlock_with_recovery_secret(
-                &hostile,
-                recovery.recipient_id(),
-                recovery.secret(),
-            ),
-            Err(Error::UnlockFailed)
-        ));
-
-        let mut hostile = envelope.clone();
-        let RecipientRecord::RecoverySecret(record) = &mut hostile.recipients[0] else {
-            panic!("fixture must contain a recovery-secret recipient");
-        };
-        let changed_id = RecipientId::from_bytes([0x6b; 32]);
-        record.id = changed_id;
-        assert!(matches!(
-            protector.unlock_with_recovery_secret(&hostile, changed_id, recovery.secret()),
-            Err(Error::UnlockFailed)
-        ));
-
-        let mut hostile = envelope.clone();
-        hostile.application_id = ApplicationId::new("org.example.other-application").unwrap();
-        let other_protector = KeyProtector::new(hostile.application_id.clone());
-        assert!(matches!(
-            other_protector.unlock_with_recovery_secret(
-                &hostile,
-                recovery.recipient_id(),
-                recovery.secret(),
-            ),
-            Err(Error::UnlockFailed)
-        ));
-
-        let mut mutable = envelope;
-        let original = mutable.encode();
-        let wrong_root = RootKey::import(&mut [0x45; 32]);
-        assert!(matches!(
-            protector.add_recovery_secret(&mut mutable, &wrong_root, "new recovery"),
-            Err(Error::EnvelopeAuthenticationFailed)
-        ));
-        assert_eq!(mutable.encode(), original);
-
-        for fault in [
-            StagedFault::CanonicalDecode,
-            StagedFault::RootMismatch,
-            StagedFault::EnvelopeMac,
-        ] {
-            fail_next_staged_validation(fault);
-            assert!(
-                protector
-                    .add_recovery_secret(&mut mutable, &root, "new recovery")
-                    .is_err()
-            );
-            assert_eq!(mutable.encode(), original);
-        }
-    }
-
-    #[test]
-    fn passphrase_rewrap_preserves_identity_root_and_old_complete_copy() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"old secret", b"old secret"]);
-        let (root, mut envelope, recipient) = protector
-            .create_root(enrollment("primary"), &mut create)
-            .unwrap();
-        let old_bytes = envelope.encode();
-
-        crypto::reset_passphrase_derivations();
-        let mut rewrap = ScriptedInteraction::new(&[b"new secret", b"new secret"]);
-        protector
-            .rewrap_passphrase(&mut envelope, &root, recipient, &mut rewrap)
-            .unwrap();
-        assert_eq!(crypto::passphrase_derivations(), 1);
-        assert_ne!(envelope.encode(), old_bytes);
-        assert_eq!(envelope.recipients()[0].id(), recipient);
-
-        let mut open_new = ScriptedInteraction::new(&[b"new secret"]);
-        let recovered = protector
-            .unlock(&envelope, recipient, &mut open_new)
-            .unwrap();
-        assert!(roots_match(&root, &recovered));
-
-        let old_envelope = KeyEnvelope::decode(&old_bytes).unwrap();
-        let mut open_old = ScriptedInteraction::new(&[b"old secret"]);
-        let recovered_old = protector
-            .unlock(&old_envelope, recipient, &mut open_old)
-            .unwrap();
-        assert!(roots_match(&root, &recovered_old));
-
-        let mut obsolete = ScriptedInteraction::new(&[b"old secret"]);
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut obsolete),
-            Err(Error::UnlockFailed)
-        ));
-    }
-
-    #[test]
-    fn explicit_cost_change_preserves_the_root_and_old_complete_copy() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"old", b"old"]);
-        let (root, mut current, recipient) = protector
-            .create_root(enrollment("primary"), &mut create)
-            .unwrap();
-        let old = current.clone();
-        let replacement = PassphraseParameters::new(65_536, 4, 2).unwrap();
-
-        let mut rewrap = ScriptedInteraction::new(&[b"new", b"new"]);
-        protector
-            .rewrap_passphrase_with_parameters(
-                &mut current,
-                &root,
-                recipient,
-                replacement,
-                &mut rewrap,
-            )
-            .unwrap();
-        assert_eq!(
-            current.recipients()[0].passphrase_parameters(),
-            Some(replacement)
-        );
-
-        let mut open_old = ScriptedInteraction::new(&[b"old"]);
-        let old_root = protector.unlock(&old, recipient, &mut open_old).unwrap();
-        let mut open_new = ScriptedInteraction::new(&[b"new"]);
-        let new_root = protector
-            .unlock(&current, recipient, &mut open_new)
-            .unwrap();
-        assert!(roots_match(&root, &old_root));
-        assert!(roots_match(&root, &new_root));
-    }
-
-    #[test]
-    fn removal_does_not_invalidate_an_old_complete_copy() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"primary", b"primary"]);
-        let (root, mut current, _primary) = protector
-            .create_root(enrollment("primary"), &mut create)
-            .unwrap();
-        let mut add = ScriptedInteraction::new(&[b"removed", b"removed"]);
-        let removed = protector
-            .add_recipient(&mut current, &root, enrollment("removed"), &mut add)
-            .unwrap();
-        let old = current.clone();
-
-        protector
-            .remove_recipient(&mut current, &root, removed)
-            .unwrap();
-        let mut no_prompt = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.unlock(&current, removed, &mut no_prompt),
-            Err(Error::RecipientNotFound)
-        ));
-        let mut open_old = ScriptedInteraction::new(&[b"removed"]);
-        let recovered = protector.unlock(&old, removed, &mut open_old).unwrap();
-        assert!(roots_match(&root, &recovered));
-    }
-
-    #[test]
-    fn mutation_failures_leave_the_exact_envelope_unchanged() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"primary", b"primary"]);
-        let (root, mut envelope, recipient) = protector
-            .create_root(enrollment("primary"), &mut create)
-            .unwrap();
-        let original = envelope.encode();
-
-        let wrong_root = RootKey::import(&mut [0x77; 32]);
-        let mut no_prompt = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.add_recipient(
-                &mut envelope,
-                &wrong_root,
-                enrollment("secondary"),
-                &mut no_prompt
-            ),
-            Err(Error::EnvelopeAuthenticationFailed)
-        ));
-        assert!(no_prompt.events.is_empty());
-        assert_eq!(envelope.encode(), original);
-
-        crypto::reset_passphrase_derivations();
-        let mut mismatch = ScriptedInteraction::new(&[b"one", b"two"]);
-        assert!(matches!(
-            protector.add_recipient(&mut envelope, &root, enrollment("secondary"), &mut mismatch),
-            Err(Error::PassphraseConfirmationMismatch)
-        ));
-        assert_eq!(crypto::passphrase_derivations(), 0);
-        assert_eq!(envelope.encode(), original);
-
-        assert!(matches!(
-            protector.remove_recipient(&mut envelope, &root, recipient),
-            Err(Error::WouldRemoveLastRecipient)
-        ));
-        assert_eq!(envelope.encode(), original);
-
-        let mut unsupported = UnsupportedInteraction;
-        assert!(matches!(
-            protector.add_recipient(
-                &mut envelope,
-                &root,
-                enrollment("unsupported"),
-                &mut unsupported,
-            ),
-            Err(Error::Interaction(InteractionError::Unsupported))
-        ));
-        assert_eq!(envelope.encode(), original);
-    }
-
-    #[test]
-    fn final_recipient_removal_fails_for_every_structural_suite() {
-        let cases = [
-            Enrollment::passphrase_with_parameters("passphrase", test_parameters()).unwrap(),
-            Enrollment::fido("fido", FidoPolicy::Presence).unwrap(),
-            Enrollment::managed_fido("managed fido", FidoPolicy::Presence).unwrap(),
-            Enrollment::fido_and_passphrase_with_parameters(
-                "combined",
-                FidoPolicy::Presence,
-                test_parameters(),
-            )
-            .unwrap(),
-        ];
-
-        for enrollment in cases {
-            let mut protector = KeyProtector::fake(application());
-            let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
-            let (root, mut envelope, recipient) =
-                protector.create_root(enrollment, &mut create).unwrap();
-            let original = envelope.encode();
-            assert!(matches!(
-                protector.remove_recipient(&mut envelope, &root, recipient),
-                Err(Error::WouldRemoveLastRecipient)
-            ));
-            assert_eq!(envelope.encode(), original);
-        }
-
-        let protector = KeyProtector::new(application());
-        let (root, mut envelope, recovery) = protector
-            .create_root_with_recovery_secret("recovery")
-            .unwrap();
-        let original = envelope.encode();
-        assert!(matches!(
-            protector.remove_recipient(&mut envelope, &root, recovery.recipient_id()),
-            Err(Error::WouldRemoveLastRecipient)
-        ));
-        assert_eq!(envelope.encode(), original);
-
-        let mut protector = KeyProtector::fake(application());
-        let mut interaction = ScriptedInteraction::new(&[]);
-        let (root, mut envelope, local) = protector
-            .create_root_with_fido_and_local_secret("paired machine", &mut interaction)
-            .unwrap();
-        let original = envelope.encode();
-        assert!(matches!(
-            protector.remove_recipient(&mut envelope, &root, local.recipient_id()),
-            Err(Error::WouldRemoveLastRecipient)
-        ));
-        assert_eq!(envelope.encode(), original);
-    }
-
-    #[test]
-    fn local_secret_creation_and_addition_validate_before_publication() {
-        let mut protector = KeyProtector::fake(application());
-        let mut root_bytes = [0x39; 32];
-        let root = RootKey::import(&mut root_bytes);
-        let mut interaction = ScriptedInteraction::new(&[]);
-        let (protected, local) = protector
-            .protect_root_with_fido_and_local_secret(&root, "paired machine", &mut interaction)
-            .unwrap();
-        let recovered = protector
-            .unlock_with_fido_and_local_secret(
-                &protected,
-                local.recipient_id(),
-                local.secret(),
-                &mut interaction,
-            )
-            .unwrap();
-        assert!(roots_match(&root, &recovered));
-
-        let (root, mut envelope, _recovery) = KeyProtector::new(application())
-            .create_root_with_recovery_secret("recovery")
-            .unwrap();
-        let original = envelope.encode();
-        for fault in [
-            StagedFault::CanonicalDecode,
-            StagedFault::RootMismatch,
-            StagedFault::EnvelopeMac,
-        ] {
-            fail_next_staged_validation(fault);
-            let mut interaction = ScriptedInteraction::new(&[]);
-            assert!(
-                protector
-                    .add_fido_and_local_secret(
-                        &mut envelope,
-                        &root,
-                        "paired machine",
-                        &mut interaction,
-                    )
-                    .is_err()
-            );
-            assert_eq!(envelope.encode(), original);
-        }
-    }
-
-    #[test]
-    fn allocation_and_staged_validation_failures_never_publish() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"primary", b"primary"]);
-        let (root, mut envelope, _) = protector
-            .create_root(enrollment("primary"), &mut create)
-            .unwrap();
-        let original = envelope.encode();
-
-        crypto::fail_next_argon2_allocation();
-        let mut allocation = ScriptedInteraction::new(&[b"new", b"new"]);
-        assert!(matches!(
-            protector.add_recipient(
-                &mut envelope,
-                &root,
-                enrollment("allocation"),
-                &mut allocation,
-            ),
-            Err(Error::KdfResourceUnavailable)
-        ));
-        assert_eq!(envelope.encode(), original);
-
-        for (fault, expected) in [
-            (StagedFault::CanonicalDecode, Error::InvalidEnvelope),
-            (StagedFault::RootMismatch, Error::UnlockFailed),
-            (StagedFault::EnvelopeMac, Error::UnlockFailed),
-        ] {
-            fail_next_staged_validation(fault);
-            let mut interaction = ScriptedInteraction::new(&[b"new", b"new"]);
-            let result = protector.add_recipient(
-                &mut envelope,
-                &root,
-                enrollment("staged failure"),
-                &mut interaction,
-            );
-            assert_eq!(
-                std::mem::discriminant(&result.unwrap_err()),
-                std::mem::discriminant(&expected)
-            );
-            assert_eq!(envelope.encode(), original);
-        }
-    }
-
-    #[test]
-    fn selected_hostile_work_is_refused_before_prompt_or_derivation() {
-        let mut creator =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut interaction = ScriptedInteraction::new(&[b"secret", b"secret"]);
-        let (_root, envelope, recipient) = creator
-            .create_root(enrollment("primary"), &mut interaction)
-            .unwrap();
-
-        let mut hostile = envelope.clone();
-        if let RecipientRecord::Passphrase(record) = &mut hostile.recipients[0] {
-            record.kdf.parameters = PassphraseParameters::new(262_144, 6, 4).unwrap();
+fn new_record(request: &Enrollment) -> Result<Record> {
+    Ok(Record {
+        id: MethodId::from_bytes(*crypto::random()?),
+        label: request.label.clone(),
+        method: request.method,
+        kdf: if request.method.needs_passphrase() {
+            Some(Kdf {
+                cost: request.cost,
+                salt: *crypto::random()?,
+            })
         } else {
-            panic!("test envelope must contain a passphrase recipient");
-        }
-        let hostile = KeyEnvelope::decode(&hostile.encode()).unwrap();
-        let mut protector = KeyProtector::new(application());
-        let mut no_prompt = ScriptedInteraction::new(&[]);
-        crypto::reset_passphrase_derivations();
-        assert!(matches!(
-            protector.unlock(&hostile, recipient, &mut no_prompt),
-            Err(Error::PassphraseLimitExceeded)
-        ));
-        assert!(no_prompt.events.is_empty());
-        assert_eq!(crypto::passphrase_derivations(), 0);
-    }
-
-    #[test]
-    fn unselected_record_tampering_converges_on_unlock_failed_after_one_kdf() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"first", b"first"]);
-        let (root, mut envelope, first) = protector
-            .create_root(enrollment("first"), &mut create)
-            .unwrap();
-        let mut add = ScriptedInteraction::new(&[b"second", b"second"]);
-        protector
-            .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
-            .unwrap();
-
-        let unselected = envelope
-            .recipients
-            .iter_mut()
-            .find(|record| record.id() != first)
-            .unwrap();
-        if let RecipientRecord::Passphrase(record) = unselected {
-            record.label = "changed".to_owned();
-        }
-        let tampered = KeyEnvelope::decode(&envelope.encode()).unwrap();
-
-        crypto::reset_passphrase_derivations();
-        let mut open = ScriptedInteraction::new(&[b"first"]);
-        assert!(matches!(
-            protector.unlock(&tampered, first, &mut open),
-            Err(Error::UnlockFailed)
-        ));
-        assert_eq!(crypto::passphrase_derivations(), 1);
-    }
-
-    #[test]
-    fn mutation_authorization_and_cancellation_fail_without_publication() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"first", b"first"]);
-        let (root, mut envelope, first) = protector
-            .create_root(enrollment("first"), &mut create)
-            .unwrap();
-        let mut add = ScriptedInteraction::new(&[b"second", b"second"]);
-        let second = protector
-            .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
-            .unwrap();
-        let original = envelope.encode();
-        let wrong_root = RootKey::import(&mut [0x99; 32]);
-
-        assert!(matches!(
-            protector.remove_recipient(&mut envelope, &wrong_root, second),
-            Err(Error::EnvelopeAuthenticationFailed)
-        ));
-        assert_eq!(envelope.encode(), original);
-
-        let mut no_prompt = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.rewrap_passphrase(&mut envelope, &wrong_root, first, &mut no_prompt),
-            Err(Error::EnvelopeAuthenticationFailed)
-        ));
-        assert!(no_prompt.events.is_empty());
-        assert_eq!(envelope.encode(), original);
-
-        let missing = RecipientId::from_bytes([0xff; 32]);
-        assert!(matches!(
-            protector.remove_recipient(&mut envelope, &root, missing),
-            Err(Error::RecipientNotFound)
-        ));
-        assert_eq!(envelope.encode(), original);
-
-        let mut cancelled = CancelledInteraction;
-        assert!(matches!(
-            protector.add_recipient(
-                &mut envelope,
-                &root,
-                enrollment("cancelled"),
-                &mut cancelled
-            ),
-            Err(Error::Interaction(InteractionError::Cancelled))
-        ));
-        assert_eq!(envelope.encode(), original);
-
-        let other_application = ApplicationId::new("org.example.other-application").unwrap();
-        let mut other = KeyProtector::new(other_application);
-        assert!(matches!(
-            other.unlock(&envelope, first, &mut no_prompt),
-            Err(Error::ApplicationMismatch)
-        ));
-        assert!(no_prompt.events.is_empty());
-    }
-
-    #[test]
-    fn rewrap_limit_refusal_precedes_interaction() {
-        let mut protector =
-            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
-        let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
-        let (root, mut envelope, recipient) = protector
-            .create_root(enrollment("primary"), &mut create)
-            .unwrap();
-        let original = envelope.encode();
-        let expensive = PassphraseParameters::new(262_144, 6, 4).unwrap();
-        let mut default_limits = KeyProtector::new(application());
-        let mut no_prompt = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            default_limits.rewrap_passphrase_with_parameters(
-                &mut envelope,
-                &root,
-                recipient,
-                expensive,
-                &mut no_prompt
-            ),
-            Err(Error::PassphraseLimitExceeded)
-        ));
-        assert!(no_prompt.events.is_empty());
-        assert_eq!(envelope.encode(), original);
-    }
-
-    #[test]
-    fn limit_refusal_precedes_interaction() {
-        let expensive = PassphraseParameters::new(262_144, 6, 4).unwrap();
-        let mut protector = KeyProtector::new(application());
-        let mut interaction = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.create_root(
-                Enrollment::passphrase_with_parameters("expensive", expensive).unwrap(),
-                &mut interaction
-            ),
-            Err(Error::PassphraseLimitExceeded)
-        ));
-        assert!(interaction.events.is_empty());
-    }
-
-    #[test]
-    fn combined_prompts_for_fido_before_passphrase() {
-        let mut protector = KeyProtector::fake(application());
-        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
-            "combined",
-            FidoPolicy::Presence,
-            test_parameters(),
-        )
-        .unwrap();
-        let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
-        let (_root, envelope, recipient) = protector.create_root(enrollment, &mut create).unwrap();
-        assert_eq!(
-            create.events,
-            [
-                "pin",
-                "enrollment touch",
-                "assertion touch",
-                "new passphrase",
-                "confirm passphrase"
-            ]
-        );
-
-        let mut open = ScriptedInteraction::new(&[b"secret"]);
-        protector.unlock(&envelope, recipient, &mut open).unwrap();
-        assert_eq!(open.events, ["assertion touch", "unlock passphrase"]);
-        let counters = protector.fake_backend_mut().counters();
-        assert_eq!(counters.enrollments, 1);
-        assert_eq!(counters.assertions, 2);
-    }
-
-    #[test]
-    fn combined_context_and_outer_ciphertext_fail_before_passphrase() {
-        type Mutation = fn(&mut FidoAndPassphraseRecipient);
-
-        let mut protector = KeyProtector::fake(application());
-        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
-            "combined",
-            FidoPolicy::Presence,
-            test_parameters(),
-        )
-        .unwrap();
-        let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
-        let (_root, envelope, recipient) = protector.create_root(enrollment, &mut create).unwrap();
-
-        let cases: [(&str, Mutation); 2] = [
-            ("altered PRF input", |record| record.prf_nonce[0] ^= 1),
-            ("altered outer ciphertext", |record| {
-                record.wrapped_root[0] ^= 1;
-            }),
-        ];
-        for (name, mutate) in cases {
-            let mut altered = envelope.clone();
-            let RecipientRecord::FidoAndPassphrase(record) = &mut altered.recipients[0] else {
-                panic!("fixture must contain a combined recipient");
-            };
-            mutate(record);
-
-            crypto::reset_passphrase_derivations();
-            let before = protector.fake_backend_mut().counters();
-            let mut open = ScriptedInteraction::new(&[]);
-            assert!(
-                matches!(
-                    protector.unlock(&altered, recipient, &mut open),
-                    Err(Error::UnlockFailed)
-                ),
-                "{name}"
-            );
-            assert_eq!(open.events, ["assertion touch"], "{name}");
-            assert_eq!(crypto::passphrase_derivations(), 0, "{name}");
-            let after = protector.fake_backend_mut().counters();
-            assert_eq!(after.assertions, before.assertions + 1, "{name}");
-        }
-    }
-
-    #[test]
-    fn fido_only_routes_never_derive_a_passphrase() {
-        for policy in [FidoPolicy::Presence, FidoPolicy::UserVerification] {
-            crypto::reset_passphrase_derivations();
-            let mut protector = KeyProtector::fake(application());
-            let mut create = ScriptedInteraction::new(&[]);
-            let (root, envelope, recipient) = protector
-                .create_root(
-                    Enrollment::fido("security key", policy).unwrap(),
-                    &mut create,
-                )
-                .unwrap();
-            assert_eq!(crypto::passphrase_derivations(), 0);
-
-            let mut open = ScriptedInteraction::new(&[]);
-            let recovered = protector.unlock(&envelope, recipient, &mut open).unwrap();
-            assert!(roots_match(&root, &recovered));
-            assert_eq!(crypto::passphrase_derivations(), 0);
-            assert!(!open.events.iter().any(|event| event.contains("passphrase")));
-        }
-    }
-
-    #[test]
-    fn managed_recipient_lifecycle_is_exact_and_does_not_mutate_the_envelope() {
-        let mut protector = KeyProtector::fake(application());
-        let mut create = ScriptedInteraction::new(&[]);
-        let (root, mut envelope, recipient) = protector
-            .create_root(
-                Enrollment::managed_fido("managed key", FidoPolicy::UserVerification).unwrap(),
-                &mut create,
-            )
-            .unwrap();
-        assert_eq!(
-            create.events,
-            ["pin", "enrollment touch", "assertion touch"]
-        );
-        assert_eq!(
-            create.touch_policies,
-            [FidoPolicy::UserVerification, FidoPolicy::UserVerification]
-        );
-        assert_eq!(
-            envelope.recipients()[0].policy(),
-            RecipientPolicy::ManagedFido(FidoPolicy::UserVerification)
-        );
-        let mut add = ScriptedInteraction::new(&[]);
-        let other = protector
-            .add_recipient(
-                &mut envelope,
-                &root,
-                Enrollment::managed_fido("other managed key", FidoPolicy::UserVerification)
-                    .unwrap(),
-                &mut add,
-            )
-            .unwrap();
-        assert_eq!(add.events, ["pin", "enrollment touch", "assertion touch"]);
-
-        let mut verify = ScriptedInteraction::new(&[]);
-        protector
-            .verify_managed_recipient(&envelope, &root, recipient, &mut verify)
-            .unwrap();
-        assert_eq!(verify.events, ["pin", "assertion touch"]);
-
-        let encoded = envelope.encode();
-        let mut retire = ScriptedInteraction::new(&[]);
-        protector
-            .retire_managed_recipient(&envelope, &root, recipient, &mut retire)
-            .unwrap();
-        assert_eq!(retire.events, ["pin", "assertion touch"]);
-        assert_eq!(envelope.encode(), encoded);
-
-        let mut open = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut open),
-            Err(Error::Authenticator(
-                AuthenticatorFailure::CredentialUnavailable
-            ))
-        ));
-        assert_eq!(open.events, ["pin", "assertion touch"]);
-
-        let mut open_other = ScriptedInteraction::new(&[]);
-        protector.unlock(&envelope, other, &mut open_other).unwrap();
-        assert_eq!(open_other.events, ["pin", "assertion touch"]);
-    }
-
-    #[test]
-    fn managed_presence_uses_touch_only_for_recovery_and_uv_for_management() {
-        let mut protector = KeyProtector::fake(application());
-        let mut create = ScriptedInteraction::new(&[]);
-        let (root, envelope, recipient) = protector
-            .create_root(
-                Enrollment::managed_fido("managed presence", FidoPolicy::Presence).unwrap(),
-                &mut create,
-            )
-            .unwrap();
-        assert_eq!(
-            create.events,
-            ["pin", "enrollment touch", "assertion touch"]
-        );
-        assert_eq!(
-            create.touch_policies,
-            [FidoPolicy::Presence, FidoPolicy::Presence]
-        );
-        assert_eq!(
-            envelope.recipients()[0].policy(),
-            RecipientPolicy::ManagedFido(FidoPolicy::Presence)
-        );
-
-        let mut open = ScriptedInteraction::new(&[]);
-        let recovered = protector.unlock(&envelope, recipient, &mut open).unwrap();
-        assert!(roots_match(&root, &recovered));
-        assert_eq!(open.events, ["assertion touch"]);
-        assert_eq!(open.touch_policies, [FidoPolicy::Presence]);
-
-        let mut verify = ScriptedInteraction::new(&[]);
-        protector
-            .verify_managed_recipient(&envelope, &root, recipient, &mut verify)
-            .unwrap();
-        assert_eq!(verify.events, ["pin", "assertion touch"]);
-        assert_eq!(verify.touch_policies, [FidoPolicy::Presence]);
-
-        let mut retire = ScriptedInteraction::new(&[]);
-        protector
-            .retire_managed_recipient(&envelope, &root, recipient, &mut retire)
-            .unwrap();
-        assert_eq!(retire.events, ["pin", "assertion touch"]);
-        assert_eq!(retire.touch_policies, [FidoPolicy::Presence]);
-
-        let mut after = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut after),
-            Err(Error::Authenticator(
-                AuthenticatorFailure::CredentialUnavailable
-            ))
-        ));
-        assert_eq!(after.events, ["assertion touch"]);
-    }
-
-    #[test]
-    fn managed_lifecycle_authenticates_before_interaction() {
-        let mut protector = KeyProtector::fake(application());
-        let mut create = ScriptedInteraction::new(&[]);
-        let (root, envelope, recipient) = protector
-            .create_root(
-                Enrollment::managed_fido("managed key", FidoPolicy::UserVerification).unwrap(),
-                &mut create,
-            )
-            .unwrap();
-        let mut wrong_bytes = [0x91; 32];
-        let wrong_root = RootKey::import(&mut wrong_bytes);
-
-        for verify in [true, false] {
-            let mut interaction = ScriptedInteraction::new(&[]);
-            let result = if verify {
-                protector.verify_managed_recipient(
-                    &envelope,
-                    &wrong_root,
-                    recipient,
-                    &mut interaction,
-                )
-            } else {
-                protector.retire_managed_recipient(
-                    &envelope,
-                    &wrong_root,
-                    recipient,
-                    &mut interaction,
-                )
-            };
-            assert!(matches!(result, Err(Error::EnvelopeAuthenticationFailed)));
-            assert!(interaction.events.is_empty());
-        }
-
-        let mut interaction = ScriptedInteraction::new(&[]);
-        protector
-            .verify_managed_recipient(&envelope, &root, recipient, &mut interaction)
-            .unwrap();
-    }
-
-    #[test]
-    fn failed_managed_staging_retires_the_created_credential() {
-        let mut protector = KeyProtector::fake(application());
-        protector.fake_backend_mut().set_managed_capacity(1);
-        fail_next_staged_validation(StagedFault::EnvelopeMac);
-
-        let mut first = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.create_root(
-                Enrollment::managed_fido("first", FidoPolicy::UserVerification).unwrap(),
-                &mut first,
-            ),
-            Err(Error::UnlockFailed)
-        ));
-        assert_eq!(
-            first.events,
-            [
-                "pin",
-                "enrollment touch",
-                "assertion touch",
-                "assertion touch"
-            ]
-        );
-        assert_eq!(protector.fake_backend_mut().counters().retirements, 1);
-
-        let mut second = ScriptedInteraction::new(&[]);
-        assert!(
-            protector
-                .create_root(
-                    Enrollment::managed_fido("second", FidoPolicy::UserVerification).unwrap(),
-                    &mut second,
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn failed_managed_cleanup_reports_that_the_credential_may_remain() {
-        use crate::backend::fake::FailurePoint;
-
-        let mut protector = KeyProtector::fake(application());
-        protector.fake_backend_mut().set_managed_capacity(1);
-        protector
-            .fake_backend_mut()
-            .fail_next(FailurePoint::Retirement);
-        fail_next_staged_validation(StagedFault::EnvelopeMac);
-
-        let mut first = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.create_root(
-                Enrollment::managed_fido("first", FidoPolicy::UserVerification).unwrap(),
-                &mut first,
-            ),
-            Err(Error::Authenticator(
-                AuthenticatorFailure::CredentialMayRemain
-            ))
-        ));
-
-        let mut second = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.create_root(
-                Enrollment::managed_fido("second", FidoPolicy::UserVerification).unwrap(),
-                &mut second,
-            ),
-            Err(Error::Authenticator(
-                AuthenticatorFailure::CredentialStoreFull
-            ))
-        ));
-    }
-
-    #[test]
-    fn failed_combined_rewrap_is_transactional_and_skips_passphrase() {
-        use crate::backend::fake::FailurePoint;
-
-        let mut protector = KeyProtector::fake(application());
-        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
-            "combined",
-            FidoPolicy::Presence,
-            test_parameters(),
-        )
-        .unwrap();
-        let mut create = ScriptedInteraction::new(&[b"old", b"old"]);
-        let (root, mut envelope, recipient) =
-            protector.create_root(enrollment, &mut create).unwrap();
-        let original = envelope.encode();
-        let before = protector.fake_backend_mut().counters();
-        protector
-            .fake_backend_mut()
-            .fail_next(FailurePoint::Assertion);
-
-        let mut rewrap = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut rewrap),
-            Err(Error::Authenticator(AuthenticatorFailure::OperationFailed))
-        ));
-        assert_eq!(envelope.encode(), original);
-        assert_eq!(rewrap.events, ["assertion touch"]);
-        let after = protector.fake_backend_mut().counters();
-        assert_eq!(after.enrollments, before.enrollments);
-        assert_eq!(after.assertions, before.assertions + 1);
-    }
-
-    #[test]
-    fn combined_rewrap_rejects_bad_flags_and_wrong_credential_transactionally() {
-        use crate::backend::fake::FailurePoint;
-
-        let mut protector = KeyProtector::fake(application());
-        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
-            "combined",
-            FidoPolicy::Presence,
-            test_parameters(),
-        )
-        .unwrap();
-        let mut create = ScriptedInteraction::new(&[b"old", b"old"]);
-        let (root, mut envelope, recipient) =
-            protector.create_root(enrollment, &mut create).unwrap();
-        let original = envelope.encode();
-
-        protector
-            .fake_backend_mut()
-            .fail_next(FailurePoint::VerifiedResponse);
-        let mut bad_flags = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut bad_flags),
-            Err(Error::AuthenticatorResponseInvalid)
-        ));
-        assert_eq!(bad_flags.events, ["assertion touch"]);
-        assert_eq!(envelope.encode(), original);
-
-        let credential_id = match envelope.find(recipient).unwrap() {
-            RecipientRecord::FidoAndPassphrase(record) => record.credential_id.clone(),
-            _ => panic!("fixture must contain a combined recipient"),
-        };
-        protector
-            .fake_backend_mut()
-            .forget_credential(&credential_id);
-        let mut wrong_credential = ScriptedInteraction::new(&[]);
-        assert!(matches!(
-            protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut wrong_credential,),
-            Err(Error::Authenticator(
-                AuthenticatorFailure::CredentialUnavailable
-            ))
-        ));
-        assert_eq!(wrong_credential.events, ["assertion touch"]);
-        assert_eq!(envelope.encode(), original);
-    }
+            None
+        },
+        credential: None,
+        nonce: *crypto::random()?,
+        wrapped: Vec::new(),
+    })
 }

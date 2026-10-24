@@ -3,21 +3,12 @@ members = [
     "crates/fido-key-wrap",
     "crates/fido-key-wrap-libfido2",
     "crates/fido-key-wrap-platform",
-    "crates/fido-key-wrap-python",
-    "crates/fkw-demo",
-    "crates/fkw-tool",
-]
-default-members = [
-    "crates/fido-key-wrap",
-    "crates/fido-key-wrap-libfido2",
-    "crates/fido-key-wrap-platform",
-    "crates/fkw-demo",
     "crates/fkw-tool",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 
@@ -27,6 +18,8 @@ aes = { version = "0.8.4", features = ["zeroize"] }
 anyhow = "1.0.103"
 argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
 clap = { version = "4.6.1", features = ["derive"] }
+chacha20poly1305 = "0.10.1"
+tempfile = "3.27.0"
 getrandom = "0.4.3"
 ghash = { version = "0.5.1", features = ["zeroize"] }
 hkdf = "0.13.0"
@@ -35,7 +28,6 @@ libc = "0.2.183"
 libloading = "0.8.9"
 minicbor = { version = "2.2.2", features = ["std"] }
 p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "std"] }
-pyo3 = "=0.29.0"
 rpassword = "7.5.4"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
 subtle = "2.6.1"
