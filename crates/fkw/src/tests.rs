@@ -108,6 +108,45 @@ fn passphrase_round_trip_and_confirmation() {
     assert_eq!(ui.pins, 0);
 }
 #[test]
+fn default_passphrase_profile_persists_and_respects_memory_ceiling() {
+    let p = protector();
+    let request = Enrollment::new(Method::Passphrase, "default").unwrap();
+    let key = p.create(&request, &mut UI::default()).unwrap();
+    let envelope = Envelope::from_bytes(&key.envelope().to_bytes()).unwrap();
+    let cost = envelope.methods().next().unwrap().kdf_cost.unwrap();
+    assert_eq!(
+        (cost.memory_kib(), cost.passes(), cost.lanes()),
+        (2_097_152, 1, 4)
+    );
+
+    let bounded = protector().with_max_kdf_cost(KdfCost::new(1_048_576, 6, 4).unwrap());
+    let mut ui = UI::default();
+    assert!(matches!(
+        bounded.unlock(&envelope, id(&key), &mut ui),
+        Err(Error::ResourceLimit)
+    ));
+    assert!(matches!(
+        bounded.create(&request, &mut ui),
+        Err(Error::ResourceLimit)
+    ));
+    assert_eq!(ui.passwords + ui.pins + ui.touches, 0);
+
+    same_key(&key, &p.unlock(&envelope, id(&key), &mut ui).unwrap());
+
+    for invalid in [
+        KdfCost {
+            memory: 2_097_168,
+            ..cost
+        },
+        KdfCost { passes: 0, ..cost },
+        KdfCost { passes: 7, ..cost },
+    ] {
+        let mut altered = envelope.clone();
+        altered.records[0].kdf.as_mut().unwrap().cost = invalid;
+        assert!(Envelope::from_bytes(&altered.to_bytes()).is_err());
+    }
+}
+#[test]
 fn policy_and_application_reject_before_interaction() {
     let (p, s, mut key) = recovery_key();
     p.add_method(

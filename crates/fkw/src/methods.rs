@@ -70,24 +70,27 @@ pub struct KdfCost {
     pub(crate) lanes: u32,
 }
 impl KdfCost {
+    /// Explicit low-memory profile: 64 MiB, three passes, one lane.
     pub const INTERACTIVE: Self = Self {
         memory: 65_536,
         passes: 3,
         lanes: 1,
     };
+    /// RFC 9106's primary profile: 2 GiB, one pass, four lanes.
     pub const DEFAULT: Self = Self {
-        memory: 262_144,
-        passes: 3,
+        memory: 2_097_152,
+        passes: 1,
         lanes: 4,
     };
+    /// Format ceiling: 2 GiB, six passes, four lanes.
     pub const MAX: Self = Self {
-        memory: 262_144,
+        memory: 2_097_152,
         passes: 6,
         lanes: 4,
     };
     pub fn new(memory_kib: u32, passes: u32, lanes: u32) -> Result<Self> {
-        if !(65_536..=262_144).contains(&memory_kib)
-            || !(3..=6).contains(&passes)
+        if !(65_536..=2_097_152).contains(&memory_kib)
+            || !(1..=6).contains(&passes)
             || !(1..=4).contains(&lanes)
             || memory_kib % (4 * lanes) != 0
         {

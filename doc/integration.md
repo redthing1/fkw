@@ -23,6 +23,9 @@ returning an `UnlockedKey`. Only the selected method needs available factors.
 | `KeyAndKeystore(options, access)` | Security key and keystore factor |
 | `RecoverySecret` | Previously generated 32-byte recovery secret |
 
+The [recommended method](security.md#recommended-protection) is
+`Method::KeyAndPassphrase(KeyOptions::new(Verification::UserVerified))`.
+
 `KeyOptions::new` selects exact `Verification::Presence` or `UserVerified`.
 Credentials are non-discoverable unless `.managed()` is selected. Only managed
 credentials support individual retirement. Enrollment requires a configured
@@ -35,8 +38,9 @@ and save recovery material before enrollment; imported recovery bytes must be
 uniformly random. Protect any copies made through `expose`.
 
 `Enrollment::with_kdf_cost` sets Argon2id work; `Protector::with_max_kdf_cost`
-bounds execution before prompts. `KdfCost::DEFAULT` uses 256 MiB, three passes,
+bounds execution before prompts. `KdfCost::DEFAULT` uses 2 GiB, one pass,
 four lanes; `INTERACTIVE` uses 64 MiB, three passes, one lane.
+See [KDF cost](security.md#kdf-cost) for tuning.
 
 Operations are synchronous. `FidoConfig` bounds each native call and device
 selection. Cancellation stops the operation, though failed managed enrollment
@@ -81,4 +85,4 @@ retired in either order. Keep the old envelope until finished.
 File outputs sync and publish without overwriting destinations. Writer failures
 after `open_to` verifies can leave partial output. For existing application
 protocols, `derive_key(purpose)` supplies a separate 32-byte key per stable purpose.
-See [security](security.md) for staging, old-copy and rollback limits.
+See [design and security](security.md) for staging, old-copy and rollback limits.

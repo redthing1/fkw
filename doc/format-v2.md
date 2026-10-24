@@ -1,10 +1,14 @@
 # Format 2
 
+Wire format and key schedule. See [design and security](security.md) for rationale.
+
 All integers are unsigned and big endian unless encoded in CBOR.
 The suite is fixed by the format version.
 Unknown versions and noncanonical encodings are rejected.
 
 ## Envelopes
+
+### Encoding and bounds
 
 `FKWE` followed by canonical, definite-length CBOR:
 
@@ -33,14 +37,16 @@ Only passphrase recipes contain KDF parameters; only key recipes contain
 credentials. Store entries are addressed by the application and method ID.
 Managed credentials use the method ID as their user ID.
 
+### Factor derivation and root wrapping
+
 `frame(parts)` is a 32-bit part count followed by a 32-bit byte length and
 bytes for each part. `context` is SHA-256 of
 `frame(["fkw/v2/method", application, envelope_id, metadata])`, where metadata
 is the canonical six-element record without `wrapped`.
 
-Argon2id v1.3 produces 32 bytes. Valid parameters are 65536–262144 KiB,
-3–6 passes, 1–4 lanes, memory divisible by four times the lanes. Defaults
-are 262144 KiB, 3 passes, 4 lanes.
+Argon2id v1.3 produces 32 bytes. Valid parameters are 65536–2097152 KiB,
+1–6 passes, 1–4 lanes, memory divisible by four times the lanes. Defaults
+are 2097152 KiB (2 GiB), 1 pass, 4 lanes.
 
 The FIDO hmac-secret salt is SHA-256 of
 `frame(["fkw/v2/prf", context])`. Native assertions must verify the signature,
@@ -60,6 +66,8 @@ passphrase key, then wraps that ciphertext with the security-key key.
 The distinct keys use the same record nonce; each key is used once.
 All other recipes wrap once. Tags are 16 bytes. Unwrapping the outer
 FIDO layer must succeed before asking for a passphrase.
+
+### Envelope authentication and application keys
 
 The envelope MAC is HMAC-SHA256 over the canonical four-element CBOR
 body (everything except mac). Its key is HKDF-SHA256(root,

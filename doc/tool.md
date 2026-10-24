@@ -1,9 +1,9 @@
-# fkw
+# CLI usage
 
 ```sh
 cargo install --git https://github.com/redthing1/fkw --locked
 fkw seal --text --armor -w passphrase
-fkw seal archive.tar -w key --uv
+fkw seal archive.tar -w key+passphrase --uv -n primary
 fkw open archive.tar.fkw -o restored.tar
 ```
 
@@ -22,27 +22,30 @@ Use `fkw COMMAND --help` for all options.
 
 Binary and armored files work with every reading command. Files use bounded
 memory; some operations need temporary disk space. New files are private on Unix.
-Original filenames and permissions are not stored. See [security](security.md).
+Original filenames and permissions are not stored.
 
 Choose protection with `-w` / `--with`, or select interactively: `key`,
 `passphrase`, `key+passphrase`, `keystore`, `key+keystore`, or `recovery`.
-Passphrases and PINs use hidden prompts. Key enrollment always requires a PIN;
-unlocking uses touch only, or PIN + touch with `--uv`. `--managed` creates a
-discoverable credential. Keystore methods accept `--store-access`; see
-[platform support](platform-storage.md). Policies never fall back to weaker ones.
+The [recommended method](security.md#recommended-protection) is
+`-w key+passphrase --uv`.
+
+Passphrases and PINs use hidden prompts. Key enrollment always requires a PIN.
+Unlocking follows the enrolled policy: touch only, or PIN + touch if enrolled
+with `--uv`. `--managed` creates a discoverable credential. Keystore methods
+accept `--store-access`; see [platform support](platform-storage.md).
 
 ## Access methods
 
 ```sh
-fkw access add archive.tar.fkw -w key -n spare
+fkw access add archive.tar.fkw -w key+passphrase --uv -n spare
 fkw recovery backup.key
 fkw access add archive.tar.fkw \
   -w recovery -n backup --new-recovery-file backup.key
 fkw info archive.tar.fkw
 fkw verify archive.tar.fkw -u backup -r backup.key
 fkw open archive.tar.fkw -u backup -r backup.key -o recovered.tar
-fkw access replace archive.tar.fkw key -w key --uv
-fkw access remove archive.tar.fkw key -u backup -r backup.key
+fkw access replace archive.tar.fkw primary -w key+passphrase --uv
+fkw access remove archive.tar.fkw primary -u backup -r backup.key
 ```
 
 Methods are alternative ways to unlock; combined recipes require both factors.
