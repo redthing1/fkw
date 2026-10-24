@@ -4,7 +4,7 @@ Key protection and sealed data, as a Rust library and a compact CLI.
 
 - **Choose your protection:** passphrases, security keys, system keystores, or recovery secrets.
 - **Combine factors:** require a security key plus a passphrase or keystore factor; add alternative methods for backup access.
-- **Seal text and files:** complete verification before plaintext is released, bounded memory for large files, and no overwriting existing destinations.
+- **Seal text and files:** complete verification before plaintext is released and bounded memory for large files.
 - **Load native support on demand:** security keys use libfido2; other methods work without it.
 
 ## Library

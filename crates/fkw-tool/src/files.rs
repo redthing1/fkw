@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use base64::{engine::general_purpose::STANDARD, read::DecoderReader, write::EncoderWriter};
 use fkw::{Envelope, Error, RecoverySecret};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, Metadata, OpenOptions},
     io::{self, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
@@ -11,6 +11,7 @@ use tempfile::{NamedTempFile, TempDir};
 
 pub struct Input {
     pub path: PathBuf,
+    pub armored: bool,
     _temporary: Option<NamedTempFile>,
 }
 impl Input {
@@ -33,6 +34,7 @@ impl Input {
         if prefix != *b"fkw:" && !stdin {
             return Ok(Self {
                 path: path.to_owned(),
+                armored: false,
                 _temporary: None,
             });
         }
@@ -47,6 +49,7 @@ impl Input {
         temporary.flush()?;
         Ok(Self {
             path: temporary.path().to_owned(),
+            armored: prefix == *b"fkw:",
             _temporary: Some(temporary),
         })
     }
@@ -144,11 +147,36 @@ fn armor(input: &mut impl Read, output: &mut impl Write) -> Result<()> {
 pub struct Work {
     directory: TempDir,
     destination: Option<PathBuf>,
+    original: Option<Metadata>,
 }
 impl Work {
     pub fn new(destination: Option<PathBuf>) -> Result<Self> {
-        let directory = if let Some(path) = &destination {
+        if let Some(path) = &destination {
             fresh_destination(path)?;
+        }
+        Self::prepare(destination, None)
+    }
+
+    pub fn edit(input: &Path, output: Option<&Path>) -> Result<Self> {
+        if output == Some(Path::new("-")) {
+            bail!("access edits require an output file");
+        }
+        if let Some(output) = output {
+            return Self::new(Some(output.to_owned()));
+        }
+        if input == Path::new("-") {
+            bail!("access edits from stdin require -o FILE");
+        }
+        let original =
+            fs::symlink_metadata(input).with_context(|| format!("cannot read {input:?}"))?;
+        if !original.is_file() {
+            bail!("updating in place requires a regular file; use -o FILE");
+        }
+        Self::prepare(Some(input.to_owned()), Some(original))
+    }
+
+    fn prepare(destination: Option<PathBuf>, original: Option<Metadata>) -> Result<Self> {
+        let directory = if let Some(path) = &destination {
             tempfile::Builder::new()
                 .prefix(".fkw-")
                 .tempdir_in(parent(path))?
@@ -158,6 +186,7 @@ impl Work {
         Ok(Self {
             directory,
             destination,
+            original,
         })
     }
     pub fn save(
@@ -182,7 +211,21 @@ impl Work {
                 } else {
                     sealed.clone()
                 };
-                publish(&source, destination)?;
+                if let Some(original) = &self.original {
+                    let current = fs::symlink_metadata(destination)?;
+                    if !same_version(original, &current)? {
+                        bail!(
+                            "input changed during the edit; saved work contains the updated copy"
+                        );
+                    }
+                    // Keep the complete result available even if directory sync fails.
+                    let replacement = self.directory.path().join("replacement");
+                    fs::hard_link(&source, &replacement)?;
+                    fs::rename(&replacement, destination)?;
+                    sync_directory(parent(destination)).map_err(Error::PublicationUncertain)?;
+                } else {
+                    publish(&source, destination)?;
+                }
                 eprintln!("Saved {destination:?}");
             } else {
                 let mut output = io::stdout().lock();
@@ -214,7 +257,23 @@ impl Work {
     }
 }
 
+fn same_version(original: &Metadata, current: &Metadata) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if original.dev() != current.dev() || original.ino() != current.ino() {
+            return Ok(false);
+        }
+    }
+    Ok(current.is_file()
+        && original.len() == current.len()
+        && original.modified()? == current.modified()?)
+}
+
 pub fn recovery(path: &Path) -> Result<()> {
+    if path == Path::new("-") {
+        bail!("recovery secrets require an output file");
+    }
     fresh_destination(path)?;
     let temporary = tempfile::Builder::new()
         .prefix(".fkw-")
@@ -260,6 +319,34 @@ mod tests {
         );
         seal::verify_file(&key, retained.join("sealed.fkw")).unwrap();
         assert!(format!("{:#}", result.unwrap_err()).contains("complete encrypted file"));
+        fs::remove_dir_all(retained).unwrap();
+    }
+
+    #[test]
+    fn changed_input_is_preserved_and_the_edit_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("input");
+        let protector = Protector::new(ApplicationId::new("test.example").unwrap());
+        let mut secret = RecoverySecret::generate().unwrap();
+        let key = protector
+            .create(
+                &Enrollment::new(Method::RecoverySecret, "backup").unwrap(),
+                &mut secret,
+            )
+            .unwrap();
+        seal::seal_reader(&key, &mut b"private text".as_slice(), &destination).unwrap();
+        let work = Work::edit(&destination, None).unwrap();
+        let retained = work.directory.path().to_owned();
+        let error = work
+            .save(key.envelope(), false, |path| {
+                seal::update_file(&key, &destination, path)?;
+                fs::write(&destination, b"another writer")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("input changed during the edit"));
+        assert_eq!(fs::read(&destination).unwrap(), b"another writer");
+        seal::verify_file(&key, retained.join("sealed.fkw")).unwrap();
         fs::remove_dir_all(retained).unwrap();
     }
 

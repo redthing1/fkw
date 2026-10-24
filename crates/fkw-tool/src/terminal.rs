@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use fkw::{
-    CredentialStorage, Envelope, Error, Interaction, Method, MethodId, Passphrase,
+    CredentialStorage, Envelope, Error, Interaction, Method, MethodId, Operation, Passphrase,
     PassphrasePurpose, Pin, Prompt, RecoverySecret, StoreAccess, Verification,
 };
 use std::{
@@ -15,7 +15,7 @@ pub struct Terminal {
     pub recovery: Option<PathBuf>,
 }
 impl Terminal {
-    pub fn choose(&self, title: &str, options: &[String], hint: &str) -> Result<usize> {
+    fn input(&self, hint: &str) -> Result<File> {
         if self.no_input {
             bail!("{hint}");
         }
@@ -23,22 +23,35 @@ impl Terminal {
         let console = "CONIN$";
         #[cfg(not(windows))]
         let console = "/dev/tty";
-        let input = File::open(console).with_context(|| hint.to_owned())?;
+        File::open(console).with_context(|| hint.to_owned())
+    }
+
+    pub fn connect_key(&self, label: &str) -> Result<()> {
+        let input = self.input("key enrollment requires terminal input; omit --no-input")?;
+        read_line(
+            input,
+            &format!("Connect the new key for {label:?}, then press Enter: "),
+        )?;
+        Ok(())
+    }
+
+    pub fn choose(&self, title: &str, options: &[String], hint: &str) -> Result<usize> {
+        let input = self.input(hint)?;
         eprintln!("{title}");
         for (index, choice) in options.iter().enumerate() {
             eprintln!("  {}. {choice}", index + 1);
         }
-        eprint!("Choice: ");
-        io::stderr().flush()?;
-        let mut line = String::new();
-        BufReader::new(input).take(64).read_line(&mut line)?;
+        let line = read_line(input, "Choice: ")?;
+        if line.trim().is_empty() {
+            return Err(Error::Cancelled.into());
+        }
         let index = line
             .trim()
             .parse::<usize>()
             .ok()
             .and_then(|n| n.checked_sub(1))
             .filter(|&n| n < options.len());
-        index.ok_or_else(|| Error::Cancelled.into())
+        index.ok_or_else(|| anyhow::anyhow!("choose a number from 1 to {}", options.len()))
     }
 
     pub fn method(
@@ -58,7 +71,7 @@ impl Terminal {
                 .collect();
             return match matches.as_slice() {
                 [one] => Ok(one.id),
-                [] => bail!("method {selector:?} not found; use info to list labels and IDs"),
+                [] => bail!("method {selector:?} not found; use 'fkw info' to list labels and IDs"),
                 _ => bail!("method selector is ambiguous; use a longer ID prefix"),
             };
         }
@@ -79,7 +92,7 @@ impl Terminal {
         let selected = self.choose(
             title,
             &choices,
-            "select a method explicitly; use info for labels and IDs, or --help for usage",
+            "select a method by label or ID; use 'fkw info' to list methods",
         )?;
         Ok(methods[selected].id)
     }
@@ -116,8 +129,11 @@ impl Interaction for Terminal {
         let value = self.hidden(&format!("{action} for {:?}: ", prompt.label))?;
         Passphrase::new(value.as_bytes().to_vec())
     }
-    fn pin(&mut self, _: Prompt<'_>) -> fkw::Result<Pin> {
-        Ok(Pin::new(&self.hidden("Security-key PIN: ")?)?)
+    fn pin(&mut self, prompt: Prompt<'_>) -> fkw::Result<Pin> {
+        Ok(Pin::new(&self.hidden(&format!(
+            "Security-key PIN to {}: ",
+            key_action(prompt)
+        ))?)?)
     }
     fn recovery_secret(&mut self, _: Prompt<'_>) -> fkw::Result<RecoverySecret> {
         let path = self
@@ -153,16 +169,39 @@ impl Interaction for Terminal {
         exact.copy_from_slice(&bytes[..32]);
         Ok(RecoverySecret::import(&mut exact))
     }
-    fn select(&mut self, _: Prompt<'_>, count: usize) -> fkw::Result<()> {
+    fn select(&mut self, prompt: Prompt<'_>, count: usize) -> fkw::Result<()> {
         if count > 1 {
-            eprintln!("Touch the security key you want to use.");
+            eprintln!("Select the key to {} by touching it.", key_action(prompt));
         }
         Ok(())
     }
-    fn touch(&mut self, _: Prompt<'_>) -> fkw::Result<()> {
-        eprintln!("Touch your security key.");
+    fn touch(&mut self, prompt: Prompt<'_>) -> fkw::Result<()> {
+        eprintln!("Touch the key to {}.", key_action(prompt));
         Ok(())
     }
+}
+
+fn read_line(input: File, prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    if BufReader::new(input).take(64).read_line(&mut line)? == 0 {
+        eprintln!();
+        return Err(Error::Cancelled.into());
+    }
+    if !line.ends_with('\n') {
+        bail!("terminal response is too long");
+    }
+    Ok(line)
+}
+
+fn key_action(prompt: Prompt<'_>) -> String {
+    let action = match prompt.operation {
+        Operation::Enroll => "enroll",
+        Operation::Unlock => "unlock",
+        Operation::Retire => "retire",
+    };
+    format!("{action} {:?}", prompt.label)
 }
 
 pub fn describe(method: Method) -> String {
@@ -178,7 +217,7 @@ pub fn describe(method: Method) -> String {
     if let Some(key) = method.key_options() {
         text.push_str(match key.verification {
             Verification::Presence => " · touch",
-            Verification::UserVerified => " · user verification",
+            Verification::UserVerified => " · PIN + touch",
         });
         if key.storage == CredentialStorage::Managed {
             text.push_str(" · managed");

@@ -87,7 +87,8 @@ fn file_defaults_outputs_and_help() {
     let missing = run(path, &["open", "input.fkw", "-r", "first.key"]);
     assert!(!missing.status.success());
     assert_eq!(missing.stdout, b"");
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("choose an output"));
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--output"));
     ok(
         path,
         &["open", "input.fkw", "-r", "first.key", "-o", "restored"],
@@ -113,6 +114,149 @@ fn file_defaults_outputs_and_help() {
         assert!(!run(path, &args).status.success());
     }
     assert_eq!(fs::read(path.join("input")).unwrap(), plain);
+}
+
+#[test]
+fn access_defaults_update_the_file_and_name_repeated_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    ok(path, &["recovery", "key"]);
+    for transport in ["-c", "--armor"] {
+        let sealed = success(piped(
+            path,
+            &["seal", transport, "-w", "recovery", "-r", "key"],
+            b"a private note",
+        ))
+        .stdout;
+        fs::write(path.join("sealed"), &sealed).unwrap();
+        for _ in 0..2 {
+            ok(
+                path,
+                &[
+                    "access", "add", "sealed", "-u", "recovery", "-w", "recovery", "-r", "key",
+                ],
+            );
+        }
+        let updated = fs::read(path.join("sealed")).unwrap();
+        assert_eq!(updated.starts_with(b"fkw:"), transport == "--armor");
+        private(&path.join("sealed"));
+        assert_eq!(
+            ok(
+                path,
+                &["open", "sealed", "-c", "-u", "recovery-3", "-r", "key"]
+            )
+            .stdout,
+            b"a private note"
+        );
+        // Explicit labels still reject collisions and leave the input intact.
+        assert!(
+            !run(
+                path,
+                &[
+                    "access",
+                    "add",
+                    "sealed",
+                    "-u",
+                    "recovery",
+                    "-w",
+                    "recovery",
+                    "-n",
+                    "recovery-2",
+                    "-r",
+                    "key",
+                ],
+            )
+            .status
+            .success()
+        );
+        assert_eq!(fs::read(path.join("sealed")).unwrap(), updated);
+        ok(
+            path,
+            &[
+                "access",
+                "replace",
+                "sealed",
+                "recovery-2",
+                "-u",
+                "recovery",
+                "-w",
+                "recovery",
+                "-r",
+                "key",
+            ],
+        );
+        ok(
+            path,
+            &[
+                "access",
+                "remove",
+                "sealed",
+                "recovery",
+                "-u",
+                "recovery-2",
+                "-r",
+                "key",
+            ],
+        );
+        let info = ok(path, &["info", "sealed"]);
+        let info = String::from_utf8(info.stdout).unwrap();
+        assert!(info.contains("\"recovery-2\"") && info.contains("\"recovery-3\""));
+        assert!(!info.contains("\"recovery\""));
+        ok(path, &["verify", "sealed", "-u", "recovery-2", "-r", "key"]);
+    }
+    let missing = run(path, &["access", "add", "-", "-w", "recovery", "-r", "key"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("stdin require -o FILE"));
+    assert!(!path.join("-").exists());
+}
+
+#[test]
+fn removal_in_place_requires_unlocking_through_a_surviving_method() {
+    let dir = fixture();
+    let path = dir.path();
+    ok(
+        path,
+        &[
+            "access",
+            "add",
+            "input.fkw",
+            "-w",
+            "recovery",
+            "-r",
+            "first.key",
+        ],
+    );
+    let original = fs::read(path.join("input.fkw")).unwrap();
+    let result = run(
+        path,
+        &[
+            "access",
+            "remove",
+            "input.fkw",
+            "primary",
+            "-u",
+            "primary",
+            "-r",
+            "first.key",
+        ],
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("method you are keeping"));
+    assert_eq!(fs::read(path.join("input.fkw")).unwrap(), original);
+    ok(
+        path,
+        &[
+            "access",
+            "remove",
+            "input.fkw",
+            "primary",
+            "-u",
+            "recovery",
+            "-r",
+            "first.key",
+        ],
+    );
+    ok(path, &["verify", "input.fkw", "-r", "first.key"]);
 }
 
 #[test]
@@ -329,7 +473,7 @@ fn damaged_files_release_no_plaintext_or_new_access() {
     let mut trailing = sealed.clone();
     trailing.push(0);
     for bytes in [changed, sealed[..sealed.len() - 1].to_vec(), trailing] {
-        fs::write(path.join("bad"), bytes).unwrap();
+        fs::write(path.join("bad"), &bytes).unwrap();
         for args in [
             vec!["open", "bad", "-c", "-r", "first.key"],
             vec!["open", "bad", "-o", "plaintext", "-r", "first.key"],
@@ -346,6 +490,7 @@ fn damaged_files_release_no_plaintext_or_new_access() {
                 "-r",
                 "first.key",
             ],
+            vec!["access", "add", "bad", "-w", "recovery", "-r", "first.key"],
         ] {
             let result = run(path, &args);
             assert!(!result.status.success());
@@ -354,6 +499,7 @@ fn damaged_files_release_no_plaintext_or_new_access() {
         }
         assert!(!path.join("plaintext").exists());
         assert!(!path.join("updated").exists());
+        assert_eq!(fs::read(path.join("bad")).unwrap(), bytes);
         assert!(!fs::read_dir(path).unwrap().any(|entry| {
             entry
                 .unwrap()
@@ -365,6 +511,7 @@ fn damaged_files_release_no_plaintext_or_new_access() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One snapshot lifecycle: reseal, restore, and reject unrelated data.
 fn retained_snapshots_resume_without_reenrollment() {
     let dir = fixture();
     let path = dir.path();
@@ -466,6 +613,24 @@ fn retained_snapshots_resume_without_reenrollment() {
         .success()
     );
     assert!(!path.join("wrong").exists());
+    ok(
+        path,
+        &[
+            "access",
+            "restore",
+            "input.fkw",
+            "--envelope",
+            "envelope",
+            "-u",
+            "backup",
+            "-r",
+            "first.key",
+        ],
+    );
+    assert_eq!(
+        fs::read(path.join("input.fkw")).unwrap(),
+        fs::read(path.join("added")).unwrap()
+    );
 }
 
 #[test]
@@ -536,4 +701,15 @@ fn recovery_permissions_and_symlink_destinations_are_enforced() {
             .success()
     );
     assert!(!path.join("missing").exists());
+    symlink("input.fkw", path.join("linked-input")).unwrap();
+    let original = fs::read(path.join("input.fkw")).unwrap();
+    let result = run(path, &["access", "add", "linked-input", "-w", "recovery"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("regular file"));
+    assert!(
+        fs::symlink_metadata(path.join("linked-input"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(path.join("input.fkw")).unwrap(), original);
 }

@@ -34,9 +34,14 @@ fn main() -> ExitCode {
                     Some(Error::InteractionUnsupported)
                 )
             }) {
-                eprintln!(
-                    "Terminal input is unavailable. Use a terminal without --no-input, or select a recovery method with --recovery-file."
-                );
+                eprintln!("Terminal input is required; use a terminal without --no-input.");
+            } else if error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<Error>(),
+                    Some(Error::Fido(fkw::diagnostics::FidoError::CredentialNotFound))
+                )
+            }) {
+                eprintln!("Use the security key enrolled for the selected method.");
             }
             ExitCode::from(
                 if error
@@ -89,11 +94,7 @@ fn run(cli: Cli) -> Result<()> {
             let input = files::Input::read(&input)?;
             let envelope = seal::inspect_file(input.path)?;
             let mut output = io::stdout().lock();
-            writeln!(
-                output,
-                "Unverified metadata · {}",
-                envelope.application_id()
-            )?;
+            writeln!(output, "Unverified unlock methods:")?;
             for method in envelope.methods() {
                 writeln!(
                     output,
@@ -257,7 +258,13 @@ fn enrollment(
     let old_label = envelope
         .and_then(|e| e.methods().find(|m| Some(m.id) == replace))
         .map(|m| m.label);
-    let name = args
+    let label_exists = |name: &str| {
+        envelope.is_some_and(|e| {
+            e.methods()
+                .any(|m| Some(m.id) != replace && m.label == name)
+        })
+    };
+    let mut name = args
         .name
         .clone()
         .or_else(|| old_label.map(str::to_owned))
@@ -268,13 +275,18 @@ fn enrollment(
                 .get_name()
                 .to_owned()
         });
+    if args.name.is_none() && old_label.is_none() {
+        let base = name.clone();
+        let mut suffix = 2;
+        while label_exists(&name) {
+            name = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+    }
     if name.is_empty() {
         bail!("method name cannot be empty");
     }
-    if envelope.is_some_and(|e| {
-        e.methods()
-            .any(|m| Some(m.id) != replace && m.label == name)
-    }) {
+    if label_exists(&name) {
         bail!("method name already exists; choose another with --name");
     }
     Ok(Enrollment::new(method, name)?)
@@ -287,16 +299,14 @@ fn access(protector: &Protector, terminal: &mut Terminal, command: &Access) -> R
         | Access::Remove { edit, .. }
         | Access::Restore { edit, .. } => edit,
     };
-    if edit.output == Path::new("-") {
-        bail!("access changes require an output file");
-    }
-    let work = files::Work::new(Some(edit.output.clone()))?;
+    let work = files::Work::edit(&edit.input, edit.output.as_deref())?;
     let input = files::Input::read(&edit.input)?;
     let envelope = match command {
         Access::Restore { envelope, .. } => files::read_envelope(envelope)?,
         _ => seal::inspect_file(&input.path)?,
     };
-    let mut key = unlock(protector, &envelope, edit.unlock.using.as_deref(), terminal)?;
+    let unlocking = select_method(&envelope, edit.unlock.using.as_deref(), terminal)?;
+    let mut key = protector.unlock(&envelope, unlocking, terminal)?;
     // Check the input before creating any new external factor.
     seal::verify_file(&key, &input.path)?;
     match command {
@@ -317,15 +327,20 @@ fn access(protector: &Protector, terminal: &mut Terminal, command: &Access) -> R
                 method.as_deref(),
                 "Choose the method to remove:",
             )?;
+            if edit.output.is_none() && target == unlocking && key.envelope().methods().len() > 1 {
+                bail!(
+                    "unlock with a method you are keeping (--using), or write a separate copy with -o"
+                );
+            }
             protector.remove_method(&mut key, target)?;
         }
         Access::Restore { .. } => {}
     }
-    work.save(key.envelope(), false, |path| {
+    work.save(key.envelope(), input.armored, |path| {
         Ok(seal::update_file(&key, &input.path, path)?)
     })?;
     if matches!(command, Access::Replace { .. } | Access::Remove { .. }) {
-        eprintln!("Older copies retain their access. External factors are still present.");
+        eprintln!("Older copies and external factors are unchanged.");
     }
     Ok(())
 }
@@ -343,6 +358,9 @@ fn enroll_method(
             bail!("--new-recovery-file requires a recovery method");
         }
         terminal.recovery = Some(path.clone());
+    }
+    if request.method().key_options().is_some() {
+        terminal.connect_key(request.label())?;
     }
     match replace {
         Some(target) => protector.replace_method(key, target, &request, terminal)?,
