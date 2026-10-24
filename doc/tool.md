@@ -1,7 +1,7 @@
 # fkw
 
 ```sh
-cargo install --git https://github.com/redthing1/fido_key_wrap --locked
+cargo install --git https://github.com/redthing1/fkw --locked
 fkw seal --text --armor -w passphrase
 fkw seal archive.tar -w key --uv
 fkw open archive.tar.fkw -o restored.tar
