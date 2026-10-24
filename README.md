@@ -1,41 +1,45 @@
-# fido-key-wrap
+# fkw
 
-A Rust library for protecting keys and sealing data with passphrases, security
-keys, system keystores, recovery secrets, or key-based two-factor combinations.
-Native security-key support loads on demand.
+Key protection and sealed data, as a Rust library and a compact CLI.
 
-Multiple methods are alternative ways to unlock the same key. Combined methods
-require both factors. Unlocking selects one method explicitly, without fallback.
+- **Choose your protection:** passphrases, security keys, system keystores, or recovery secrets.
+- **Combine factors:** require a security key plus a passphrase or keystore factor; add alternative methods for backup access.
+- **Seal text and files:** complete verification before plaintext is released, bounded memory for large files, and no overwriting existing destinations.
+- **Load native support on demand:** security keys use libfido2; other methods work without it.
+
+## Library
+
+```toml
+[dependencies]
+fkw = { git = "https://github.com/redthing1/fkw" }
+```
 
 ```rust
-use fido_key_wrap::{
-    ApplicationId, Enrollment, Method, Passphrase, Protector, Result, seal,
-};
+use fkw::{ApplicationId, Enrollment, Method, Passphrase, Protector, Result, seal};
 
 fn seal_note(passphrase: Vec<u8>, text: &[u8]) -> Result<Vec<u8>> {
     let protector = Protector::new(ApplicationId::new("notes.example")?);
-    let mut input = Passphrase::new(passphrase)?;
-    let key = protector.create(
-        &Enrollment::new(Method::Passphrase, "personal")?,
-        &mut input,
-    )?;
+    let enrollment = Enrollment::new(Method::Passphrase, "personal")?;
+    let key = protector.create(&enrollment, &mut Passphrase::new(passphrase)?)?;
     seal::seal_bytes(&key, text)
 }
 ```
 
-The byte API handles up to 1 MiB; file APIs use bounded memory. Opening verifies
-the complete contents before releasing plaintext. File outputs never overwrite
-an existing destination.
+Use `derive_key` for application keys or `seal` for complete data operations.
+Byte helpers accept up to 1 MiB; file helpers process larger inputs with bounded
+memory. See [library usage](doc/integration.md) for methods and lifecycle.
 
 ## CLI
 
 ```sh
 cargo install --git https://github.com/redthing1/fkw --locked
+
 fkw seal --text --armor -w passphrase
 fkw seal archive.tar -w key --uv
 fkw open archive.tar.fkw -o restored.tar
 ```
 
-See [library usage](doc/integration.md), [CLI usage](doc/tool.md),
-[platform support](doc/platform-storage.md), and [security](doc/security.md).
-The [format](doc/format-v2.md) has not been independently audited.
+Seal files, pipe data, manage access methods, and create recovery secrets.
+See [CLI usage](doc/tool.md) for examples and options.
+
+[Platform support](doc/platform-storage.md) · [Security model](doc/security.md) · [File format](doc/format-v2.md)

@@ -4,7 +4,7 @@ use crate::{
     Prompt, Result, Verification, crypto,
     envelope::{Credential, Record},
 };
-use fido_key_wrap_libfido2 as native;
+use fkw_libfido2 as native;
 use zeroize::Zeroizing;
 
 pub(crate) struct Keys {
@@ -57,7 +57,7 @@ impl Keys {
         let result = authenticator.enroll(
             native::EnrollmentRequest {
                 relying_party_id: app.as_str(),
-                relying_party_name: "fido key wrap",
+                relying_party_name: "fkw",
                 policy: policy(options.verification),
                 storage: match options.storage {
                     CredentialStorage::NonDiscoverable => {

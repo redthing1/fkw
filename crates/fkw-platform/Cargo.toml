@@ -1,5 +1,5 @@
 [package]
-name = "fido-key-wrap-platform"
+name = "fkw-platform"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

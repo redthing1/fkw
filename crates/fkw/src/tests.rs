@@ -1,6 +1,6 @@
 use crate::platform::fake::Device;
 use crate::*;
-use fido_key_wrap_platform::testing::MemoryStore;
+use fkw_platform::testing::MemoryStore;
 use std::{
     fs,
     sync::{Arc, atomic::Ordering::SeqCst},

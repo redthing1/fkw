@@ -697,15 +697,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "fido-key-wrap"
+name = "fkw"
 version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
  "argon2",
  "chacha20poly1305",
- "fido-key-wrap-libfido2",
- "fido-key-wrap-platform",
+ "fkw-libfido2",
+ "fkw-platform",
  "getrandom 0.4.3",
  "ghash",
  "hkdf 0.13.0",
@@ -720,7 +720,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fido-key-wrap-libfido2"
+name = "fkw-libfido2"
 version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
@@ -730,7 +730,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fido-key-wrap-platform"
+name = "fkw-platform"
 version = "0.2.0"
 dependencies = [
  "core-foundation",
@@ -751,7 +751,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
- "fido-key-wrap",
+ "fkw",
  "rpassword",
  "tempfile",
  "zeroize",

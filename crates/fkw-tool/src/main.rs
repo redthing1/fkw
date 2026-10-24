@@ -1,4 +1,4 @@
-//! A terminal client of the public fido-key-wrap API.
+//! A terminal client of the public fkw API.
 #![allow(clippy::unnecessary_debug_formatting)] // Escape control characters in paths and labels.
 mod args;
 mod files;
@@ -7,7 +7,7 @@ mod terminal;
 use anyhow::{Context, Result, bail};
 use args::{Access, Cli, Command, Enroll, Recipe};
 use clap::{Parser, ValueEnum};
-use fido_key_wrap::{
+use fkw::{
     ApplicationId, Enrollment, Envelope, Error, KeyOptions, Method, MethodId, Protector,
     StoreAccess, UnlockedKey, Verification, seal,
 };
@@ -20,6 +20,7 @@ use std::{
 use terminal::Terminal;
 use zeroize::Zeroizing;
 
+// Persistent identity shared by sealed files, credentials, and keystore entries.
 const APPLICATION: &str = "io.fido-key-wrap.cli";
 
 fn main() -> ExitCode {

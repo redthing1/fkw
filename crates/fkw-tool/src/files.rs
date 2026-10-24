@@ -1,7 +1,7 @@
 //! CLI transport and publication. Encrypted containers are produced by the library.
 use anyhow::{Context, Result, bail};
 use base64::{engine::general_purpose::STANDARD, read::DecoderReader, write::EncoderWriter};
-use fido_key_wrap::{Envelope, Error, RecoverySecret};
+use fkw::{Envelope, Error, RecoverySecret};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, IsTerminal, Read, Write},
@@ -229,7 +229,7 @@ pub fn recovery(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fido_key_wrap::{ApplicationId, Enrollment, Method, Protector, seal};
+    use fkw::{ApplicationId, Enrollment, Method, Protector, seal};
 
     #[test]
     fn publication_race_retains_enrollment_and_complete_ciphertext() {

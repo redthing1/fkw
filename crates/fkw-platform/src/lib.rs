@@ -224,10 +224,12 @@ use macos::{create as platform_create, load as platform_load, remove as platform
 use unsupported::{create as platform_create, load as platform_load, remove as platform_remove};
 #[cfg(target_os = "macos")]
 fn service_name(app: &str) -> String {
+    // Stable v2 storage namespace.
     format!("fido-key-wrap.v2.factor:{app}")
 }
 #[cfg(target_os = "macos")]
 fn authenticated_service_name(app: &str) -> String {
+    // Stable v2 storage namespace.
     format!("fido-key-wrap.v2.authenticated-factor:{app}")
 }
 fn recipient_name(id: EntryId) -> String {

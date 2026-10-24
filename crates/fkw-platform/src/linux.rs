@@ -8,7 +8,8 @@ use crate::{
     Removal, Result, StandardStore, StoreError, binary_matches, import_binary, recipient_name,
 };
 
-const LABEL: &str = "fido key wrap local secret";
+const LABEL: &str = "fkw local secret";
+// These v2 lookup identifiers must match existing stored entries.
 const SCHEMA: &str = "org.fido-key-wrap.v2.factor";
 
 struct EntryKey<'a> {

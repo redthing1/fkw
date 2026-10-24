@@ -8,12 +8,13 @@ publish = false
 [[bin]]
 name = "fkw"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
-fido-key-wrap = { path = "../fido-key-wrap" }
+fkw = { path = "../fkw" }
 tempfile.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true

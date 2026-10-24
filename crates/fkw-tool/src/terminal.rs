@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use fido_key_wrap::{
+use fkw::{
     CredentialStorage, Envelope, Error, Interaction, Method, MethodId, Passphrase,
     PassphrasePurpose, Pin, Prompt, RecoverySecret, StoreAccess, Verification,
 };
@@ -84,7 +84,7 @@ impl Terminal {
         Ok(methods[selected].id)
     }
 
-    pub fn hidden(&self, prompt: &str) -> fido_key_wrap::Result<Zeroizing<String>> {
+    pub fn hidden(&self, prompt: &str) -> fkw::Result<Zeroizing<String>> {
         if self.no_input {
             return Err(Error::InteractionUnsupported);
         }
@@ -107,7 +107,7 @@ impl Interaction for Terminal {
         &mut self,
         prompt: Prompt<'_>,
         purpose: PassphrasePurpose,
-    ) -> fido_key_wrap::Result<Passphrase> {
+    ) -> fkw::Result<Passphrase> {
         let action = match purpose {
             PassphrasePurpose::New => "New passphrase",
             PassphrasePurpose::Confirm => "Confirm passphrase",
@@ -116,10 +116,10 @@ impl Interaction for Terminal {
         let value = self.hidden(&format!("{action} for {:?}: ", prompt.label))?;
         Passphrase::new(value.as_bytes().to_vec())
     }
-    fn pin(&mut self, _: Prompt<'_>) -> fido_key_wrap::Result<Pin> {
+    fn pin(&mut self, _: Prompt<'_>) -> fkw::Result<Pin> {
         Ok(Pin::new(&self.hidden("Security-key PIN: ")?)?)
     }
-    fn recovery_secret(&mut self, _: Prompt<'_>) -> fido_key_wrap::Result<RecoverySecret> {
+    fn recovery_secret(&mut self, _: Prompt<'_>) -> fkw::Result<RecoverySecret> {
         let path = self
             .recovery
             .as_ref()
@@ -153,13 +153,13 @@ impl Interaction for Terminal {
         exact.copy_from_slice(&bytes[..32]);
         Ok(RecoverySecret::import(&mut exact))
     }
-    fn select(&mut self, _: Prompt<'_>, count: usize) -> fido_key_wrap::Result<()> {
+    fn select(&mut self, _: Prompt<'_>, count: usize) -> fkw::Result<()> {
         if count > 1 {
             eprintln!("Touch the security key you want to use.");
         }
         Ok(())
     }
-    fn touch(&mut self, _: Prompt<'_>) -> fido_key_wrap::Result<()> {
+    fn touch(&mut self, _: Prompt<'_>) -> fkw::Result<()> {
         eprintln!("Touch your security key.");
         Ok(())
     }
@@ -197,7 +197,7 @@ pub fn describe(method: Method) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fido_key_wrap::{ApplicationId, Enrollment, Protector};
+    use fkw::{ApplicationId, Enrollment, Protector};
 
     #[test]
     fn a_label_cannot_silently_override_another_methods_id_prefix() {

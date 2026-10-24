@@ -22,7 +22,7 @@ use crate::{
     service_name,
 };
 
-const LABEL: &str = "fido key wrap local secret";
+const LABEL: &str = "fkw local secret";
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_NOT_AVAILABLE: i32 = -25_291;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25_308;

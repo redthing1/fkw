@@ -1,5 +1,5 @@
 [package]
-name = "fido-key-wrap"
+name = "fkw"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,12 +9,12 @@ publish = false
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 tempfile.workspace = true
-fido-key-wrap-platform = { path = "../fido-key-wrap-platform" }
+fkw-platform = { path = "../fkw-platform" }
 # enable aes round-key cleanup and ghash construction-temporary cleanup.
 aes.workspace = true
 ghash.workspace = true
 argon2.workspace = true
-fido-key-wrap-libfido2 = { path = "../fido-key-wrap-libfido2" }
+fkw-libfido2 = { path = "../fkw-libfido2" }
 getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
@@ -26,7 +26,7 @@ thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-fido-key-wrap-platform = { path = "../fido-key-wrap-platform", features = ["testing"] }
+fkw-platform = { path = "../fkw-platform", features = ["testing"] }
 
 [lints]
 workspace = true

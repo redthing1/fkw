@@ -22,6 +22,7 @@ use crate::{
     import_binary, recipient_name,
 };
 
+// Part of the persistent deletion identity, not just a display label.
 const LABEL_PREFIX: &str = "fido key wrap authenticated factor ";
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_NOT_AVAILABLE: i32 = -25_291;

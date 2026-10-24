@@ -6,8 +6,8 @@
 //! happens only when a security-key operation is selected.
 //!
 //! ```
-//! use fido_key_wrap::{ApplicationId, Enrollment, Method, Protector, RecoverySecret, seal};
-//! # fn main() -> fido_key_wrap::Result<()> {
+//! use fkw::{ApplicationId, Enrollment, Method, Protector, RecoverySecret, seal};
+//! # fn main() -> fkw::Result<()> {
 //! let protector = Protector::new(ApplicationId::new("notes.example")?);
 //! let mut recovery = RecoverySecret::generate()?;
 //! // In a persistent application, securely save recovery before enrollment.
@@ -34,8 +34,8 @@ mod secret;
 
 pub use envelope::{Envelope, MethodInfo};
 pub use error::{Error, Result};
-pub use fido_key_wrap_libfido2::{Config as FidoConfig, Pin};
-pub use fido_key_wrap_platform::{
+pub use fkw_libfido2::{Config as FidoConfig, Pin};
+pub use fkw_platform::{
     Access as StoreAccess, Keystore, NativeStore, Removal, Secret as StoreSecret, StoreError,
 };
 pub use id::{ApplicationId, MethodId};
@@ -45,7 +45,7 @@ pub use protector::{Protector, UnlockedKey};
 pub use secret::{DerivedKey, Passphrase, RecoverySecret};
 /// Native errors and read-only device diagnostics.
 pub mod diagnostics {
-    pub use fido_key_wrap_libfido2::{
+    pub use fkw_libfido2::{
         Capabilities, DeviceReport, DeviceStatus, Error as FidoError, Incompatibility,
         runtime_available,
     };

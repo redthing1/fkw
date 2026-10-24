@@ -1,4 +1,4 @@
-use fido_key_wrap::{ApplicationId, Enrollment, Method, Protector, RecoverySecret, seal};
+use fkw::{ApplicationId, Enrollment, Method, Protector, RecoverySecret, seal};
 use std::{
     fs,
     io::Write,

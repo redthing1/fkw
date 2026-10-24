@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn absent_runtime_is_reported_cleanly() {
         assert!(matches!(
-            load_api_from(&["/fido-key-wrap/no-such-libfido2"]),
+            load_api_from(&["/fkw/no-such-libfido2"]),
             Err(Error::LibraryUnavailable)
         ));
     }

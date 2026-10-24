@@ -1677,7 +1677,7 @@ impl Credential {
             request.relying_party_name,
             "relying-party name contains a NUL byte",
         )?;
-        let user_name = c_string("fido-key-wrap", "fixed user name is invalid")?;
+        let user_name = c_string("fkw", "fixed user name is invalid")?;
         let mut credential = Self::new()?;
         credential.call("set client-data hash", |raw| unsafe {
             ffi::fido_cred_set_clientdata_hash(

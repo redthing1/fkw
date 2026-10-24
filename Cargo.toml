@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/fido-key-wrap",
-    "crates/fido-key-wrap-libfido2",
-    "crates/fido-key-wrap-platform",
+    "crates/fkw",
+    "crates/fkw-libfido2",
+    "crates/fkw-platform",
     "crates/fkw-tool",
 ]
 resolver = "3"

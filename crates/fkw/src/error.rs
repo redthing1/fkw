@@ -42,7 +42,7 @@ pub enum Error {
     #[error("secure randomness unavailable")]
     RandomUnavailable,
     #[error("security key: {0}")]
-    Fido(#[from] fido_key_wrap_libfido2::Error),
+    Fido(#[from] fkw_libfido2::Error),
     #[error("keystore: {0}")]
     Store(#[from] crate::StoreError),
     #[error("enrollment failed; an external factor may remain for method {method}: {cause}")]
