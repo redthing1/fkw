@@ -5,6 +5,7 @@ pub enum Operation {
     Enroll,
     Unlock,
     Retire,
+    Sign,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PassphrasePurpose {
@@ -16,9 +17,14 @@ pub enum PassphrasePurpose {
 #[derive(Clone, Copy, Debug)]
 pub struct Prompt<'a> {
     pub operation: Operation,
-    pub id: MethodId,
     pub label: &'a str,
-    pub method: Method,
+    pub target: Target,
+}
+/// The object involved in an interaction.
+#[derive(Clone, Copy, Debug)]
+pub enum Target {
+    Method { id: MethodId, method: Method },
+    SigningKey,
 }
 /// Synchronous interaction boundary. No native handles or cryptographic policy.
 ///

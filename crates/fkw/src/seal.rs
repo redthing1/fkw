@@ -6,16 +6,17 @@ use crate::{
     Envelope, Error, Interaction, MethodId, Protector, Result, UnlockedKey, crypto,
     envelope::MAX_ENVELOPE_BYTES,
 };
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::AeadInPlace};
+use crate::{
+    files::{exact, publish, staging_file},
+    payload,
+};
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
-use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
-const CHUNK: usize = 65_536;
 /// Byte helpers are bounded; use file operations for larger data.
 pub const MAX_PLAINTEXT_BYTES: usize = 1_048_576;
 const MAX_SEALED_BYTES: usize = MAX_PLAINTEXT_BYTES + MAX_ENVELOPE_BYTES + 1024;
@@ -178,34 +179,6 @@ fn open_into_private(
     let key = protector.unlock(&envelope, method, interaction)?;
     decrypt(&key, &nonce, input, output, None)
 }
-fn staging_file(output: &Path) -> Result<NamedTempFile> {
-    match fs::symlink_metadata(output) {
-        Ok(_) => {
-            return Err(
-                io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists").into(),
-            );
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(NamedTempFile::new_in(parent(output))?)
-}
-fn parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-fn publish(staged: NamedTempFile, output: &Path) -> Result<()> {
-    staged.as_file().sync_all()?;
-    staged
-        .persist_noclobber(output)
-        .map_err(|error| error.error)?;
-    #[cfg(unix)]
-    File::open(parent(output))
-        .and_then(|directory| directory.sync_all())
-        .map_err(Error::PublicationUncertain)?;
-    Ok(())
-}
 fn write_header(envelope: &Envelope, nonce: &[u8; 32], output: &mut impl Write) -> Result<()> {
     let bytes = envelope.to_bytes();
     output.write_all(b"FKWS\x02")?;
@@ -243,18 +216,6 @@ fn stream_key(key: &UnlockedKey, nonce: &[u8; 32]) -> (Zeroizing<[u8; 32]>, [u8;
         crypto::hash(&[b"fkw/v2/stream", app, id, nonce]),
     )
 }
-fn frame_nonce(index: u64, final_flag: u8) -> [u8; 12] {
-    let mut nonce = [0; 12];
-    nonce[3..11].copy_from_slice(&index.to_be_bytes());
-    nonce[11] = final_flag;
-    nonce
-}
-fn associated_data(context: &[u8; 32], header: [u8; 5]) -> [u8; 37] {
-    let mut aad = [0; 37];
-    aad[..32].copy_from_slice(context);
-    aad[32..].copy_from_slice(&header);
-    aad
-}
 fn encrypt(key: &UnlockedKey, input: &mut impl Read, output: &mut impl Write) -> Result<()> {
     let nonce = crypto::random()?;
     encrypt_with_nonce(key, &nonce, input, output)
@@ -267,38 +228,7 @@ fn encrypt_with_nonce(
 ) -> Result<()> {
     write_header(&key.envelope, nonce, output)?;
     let (secret, context) = stream_key(key, nonce);
-    let cipher = ChaCha20Poly1305::new((&*secret).into());
-    let mut current = Zeroizing::new(vec![0; CHUNK]);
-    let mut next = Zeroizing::new(vec![0; CHUNK]);
-    let mut len = fill(input, &mut current)?;
-    let mut index = 0u64;
-    loop {
-        let next_len = if len == CHUNK {
-            fill(input, &mut next)?
-        } else {
-            0
-        };
-        let final_flag = u8::from(next_len == 0);
-        let mut header = [0; 5];
-        header[..4].copy_from_slice(&u32::try_from(len).expect("bounded chunk").to_be_bytes());
-        header[4] = final_flag;
-        let tag = cipher
-            .encrypt_in_place_detached(
-                (&frame_nonce(index, final_flag)).into(),
-                &associated_data(&context, header),
-                &mut current[..len],
-            )
-            .map_err(|_| Error::InvalidSealedData)?;
-        output.write_all(&header)?;
-        output.write_all(&current[..len])?;
-        output.write_all(&tag)?;
-        if final_flag == 1 {
-            return Ok(());
-        }
-        index = index.checked_add(1).ok_or(Error::ResourceLimit)?;
-        std::mem::swap(&mut current, &mut next);
-        len = next_len;
-    }
+    payload::encrypt(&secret, &context, input, output)
 }
 #[cfg(test)]
 pub(crate) fn deterministic_vector(
@@ -318,65 +248,5 @@ fn decrypt(
     limit: Option<u64>,
 ) -> Result<()> {
     let (secret, context) = stream_key(key, nonce);
-    let cipher = ChaCha20Poly1305::new((&*secret).into());
-    let mut index = 0u64;
-    let mut total = 0u64;
-    loop {
-        let mut header = [0; 5];
-        exact(input, &mut header)?;
-        let len = u32::from_be_bytes(header[..4].try_into().expect("four bytes")) as usize;
-        let final_flag = header[4];
-        if len > CHUNK
-            || final_flag > 1
-            || (final_flag == 0 && len != CHUNK)
-            || (len == 0 && index != 0)
-        {
-            return Err(Error::InvalidSealedData);
-        }
-        total = total.checked_add(len as u64).ok_or(Error::ResourceLimit)?;
-        if limit.is_some_and(|max| total > max) {
-            return Err(Error::ResourceLimit);
-        }
-        let mut buffer = Zeroizing::new(vec![0; len]);
-        let mut tag = [0; 16];
-        exact(input, &mut buffer)?;
-        exact(input, &mut tag)?;
-        cipher
-            .decrypt_in_place_detached(
-                (&frame_nonce(index, final_flag)).into(),
-                &associated_data(&context, header),
-                &mut buffer,
-                (&tag).into(),
-            )
-            .map_err(|_| Error::UnlockFailed)?;
-        output.write_all(&buffer)?;
-        if final_flag == 1 {
-            if fill(input, &mut [0; 1])? != 0 {
-                return Err(Error::InvalidSealedData);
-            }
-            return Ok(());
-        }
-        index = index.checked_add(1).ok_or(Error::ResourceLimit)?;
-    }
-}
-fn exact(input: &mut impl Read, buffer: &mut [u8]) -> Result<()> {
-    input.read_exact(buffer).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            Error::InvalidSealedData
-        } else {
-            error.into()
-        }
-    })
-}
-fn fill(input: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
-    let mut count = 0;
-    while count < buffer.len() {
-        match input.read(&mut buffer[count..]) {
-            Ok(0) => break,
-            Ok(n) => count += n,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(count)
+    payload::decrypt(&secret, &context, input, output, limit)
 }

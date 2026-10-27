@@ -33,6 +33,7 @@ security-key PIN; presence-only unlocking does not send one.
 
 `Enrollment::new(method, label)` contains no secrets. `Interaction` supplies
 secrets and handles touch/selection prompts. Escape unverified labels for display.
+`Prompt::target` distinguishes an access method from a signing key.
 `Passphrase` and `RecoverySecret` also implement `Interaction` directly. Generate
 and save recovery material before enrollment; imported recovery bytes must be
 uniformly random. Protect any copies made through `expose`.
@@ -69,7 +70,9 @@ envelope. Keystore cleanup needs no old security key, retains OS authorization,
 and returns `Removal::Absent` when already complete. Combined factors can be
 retired in either order. Keep the old envelope until finished.
 
-## Data operations
+## Sealed data
+
+The `seal` module provides complete encrypted containers:
 
 | API | Behavior |
 | --- | --- |
@@ -86,3 +89,51 @@ File outputs sync and publish without overwriting destinations. Writer failures
 after `open_to` verifies can leave partial output. For existing application
 protocols, `derive_key(purpose)` supplies a separate 32-byte key per stable purpose.
 See [design and security](security.md) for staging, old-copy and rollback limits.
+
+## Public-key encryption
+
+`recipient::Recipient::from_key(&key)` derives a public identity from an
+`UnlockedKey`. Save the protection envelope as usual; distribute only the
+recipient's `to_bytes()` through an authenticated channel. Senders import it
+with `Recipient::from_bytes` and need no unlock factors or native FIDO runtime.
+
+```rust
+use fkw::{Result, UnlockedKey, recipient};
+
+fn round_trip(key: &UnlockedKey, message: &[u8]) -> Result<()> {
+    let public = recipient::Recipient::from_key(key)?;
+    let encrypted = recipient::encrypt_bytes(&public, message)?;
+    let opened = recipient::decrypt_bytes(key, &encrypted)?;
+    assert_eq!(opened.as_slice(), message);
+    Ok(())
+}
+```
+
+`encrypt_file`, `encrypt_reader`, `decrypt_file`, `decrypt_to`, and `verify_file`
+provide the same bounded-memory staging and publication guarantees as `seal`.
+Byte operations accept at most 1 MiB of plaintext. Access-method changes and
+recovery preserve the recipient identity. Creating a new root changes it;
+senders must receive the new public key. Encryption does not identify the sender.
+
+## Hardware signing
+
+`sign::Signer::new(application).create(interaction)` enrolls a dedicated FIDO2
+credential requiring PIN and touch. Save the returned `Credential::to_bytes()`
+before signing; retry a failed save with the same handle. It addresses the key
+on its original token and contains no plaintext private key. Export
+`credential.verification_key().to_bytes()` through an authenticated channel.
+
+`Signer::sign`, `sign_file`, and `sign_reader` take the credential, an explicit
+purpose, the message, and an `Interaction`. Persist the resulting
+`Signature::to_bytes()` separately from the message.
+
+Offline verification imports `VerificationKey` and `Signature` with `from_bytes`,
+then calls `verify`, `verify_file`, or `verify_reader` with the expected purpose
+and message. Parsing checks structure; obtain the public key from a trusted
+source. Verification loads no native runtime. Purposes contain 1–128 UTF-8 bytes
+without control characters; choose stable names such as `release` or `approval`.
+
+Signing credentials are non-discoverable and cannot be individually retired or
+recovered through a protection envelope. Back up the handle and authorize a
+separate signing key if needed. Applications own key trust, revocation, replay
+prevention, and any approval or delegation rules.

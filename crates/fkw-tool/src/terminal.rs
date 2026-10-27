@@ -200,6 +200,7 @@ fn key_action(prompt: Prompt<'_>) -> String {
         Operation::Enroll => "enroll",
         Operation::Unlock => "unlock",
         Operation::Retire => "retire",
+        Operation::Sign => "sign",
     };
     format!("{action} {:?}", prompt.label)
 }

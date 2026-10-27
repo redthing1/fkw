@@ -5,10 +5,10 @@ use std::path::PathBuf;
 #[command(
     name = "fkw",
     version,
-    about = "Seal secrets and files",
+    about = "Protect keys, encrypt files, and sign with a security key",
     disable_help_subcommand = true,
     max_term_width = 100,
-    after_help = "Examples:\n  fkw seal notes.txt -w key\n  fkw seal --text --armor -w passphrase\n  fkw open notes.txt.fkw -o restored.txt"
+    after_help = "Examples:\n  fkw seal notes.txt -w key+passphrase --uv\n  fkw seal --text --armor -w passphrase\n  fkw open notes.txt.fkw -o restored.txt"
 )]
 pub struct Cli {
     /// Recovery file for unlocking or enrollment.
@@ -31,7 +31,7 @@ pub struct Cli {
 pub enum Command {
     /// Seal a file, stdin, or hidden text.
     #[command(
-        after_help = "Defaults: FILE.fkw for files; stdout with --armor and no input filename.\nKey enrollment requires a PIN; unlocking uses touch only unless --uv is set."
+        after_help = "Defaults: FILE.fkw for files; stdout with --armor and no input filename.\nEnroll an unlock method with --with, or encrypt to a public key with --to."
     )]
     Seal(Seal),
     /// Decrypt to a new file or stdout.
@@ -47,20 +47,37 @@ pub enum Command {
         output: Output,
         #[command(flatten)]
         unlock: Unlock,
+        /// Protected identity for a file encrypted to a public recipient.
+        #[arg(long, value_name = "FILE")]
+        identity: Option<PathBuf>,
+    },
+    /// Sign a file with a security key.
+    Sign(Sign),
+    /// Verify encrypted data or a detached signature.
+    Verify {
+        /// File to verify; omit or use - for stdin.
+        #[arg(default_value = "-", value_name = "FILE")]
+        input: PathBuf,
+        #[command(flatten)]
+        unlock: Unlock,
+        /// Protected identity for a file encrypted to a public recipient.
+        #[arg(long, conflicts_with = "signature", value_name = "FILE")]
+        identity: Option<PathBuf>,
+        /// Detached signature to verify.
+        #[arg(long, requires = "key", conflicts_with = "using", value_name = "FILE")]
+        signature: Option<PathBuf>,
+        /// Trusted public verification key.
+        #[arg(long, requires = "signature", value_name = "FILE")]
+        key: Option<PathBuf>,
+        /// Expected signature purpose.
+        #[arg(long, requires = "signature", default_value = "file")]
+        purpose: String,
     },
     /// Show unlock methods (unverified).
     Info {
         /// Sealed file; omit or use - for stdin.
         #[arg(default_value = "-", value_name = "FILE")]
         input: PathBuf,
-    },
-    /// Verify a sealed file without writing plaintext.
-    Verify {
-        /// Sealed file; omit or use - for stdin.
-        #[arg(default_value = "-", value_name = "FILE")]
-        input: PathBuf,
-        #[command(flatten)]
-        unlock: Unlock,
     },
     /// Manage a file's unlock methods.
     #[command(
@@ -69,6 +86,16 @@ pub enum Command {
     Access {
         #[command(subcommand)]
         command: Access,
+    },
+    /// Create a protected recipient identity or export its public key.
+    Recipient {
+        #[command(subcommand)]
+        command: RecipientCommand,
+    },
+    /// Enroll a hardware signing key or export its public key.
+    Signer {
+        #[command(subcommand)]
+        command: SignerCommand,
     },
     /// Create a recovery secret in a new file.
     #[command(after_help = "Keep the recovery file separate from your sealed data.")]
@@ -79,8 +106,69 @@ pub enum Command {
     },
 }
 
+#[derive(Subcommand)]
+pub enum RecipientCommand {
+    /// Create a protected identity and its .pub file.
+    Create {
+        /// New protected identity file.
+        #[arg(value_name = "FILE")]
+        output: PathBuf,
+        #[command(flatten)]
+        enroll: Enroll,
+    },
+    /// Export an identity's public recipient key.
+    Public {
+        /// Protected identity file.
+        #[arg(value_name = "IDENTITY")]
+        identity: PathBuf,
+        /// New public recipient file.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+        #[command(flatten)]
+        unlock: Unlock,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SignerCommand {
+    /// Create a signing key and its .pub file (PIN + touch).
+    Create {
+        /// New signing key file.
+        #[arg(value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Export a signing key's public verification key.
+    Public {
+        /// Signing key file; no token required.
+        #[arg(value_name = "KEY")]
+        key: PathBuf,
+        /// New public verification file.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Args)]
+pub struct Sign {
+    /// File to sign; use - for stdin and specify -o.
+    #[arg(value_name = "FILE")]
+    pub input: PathBuf,
+    /// Signing key file.
+    #[arg(long, value_name = "FILE")]
+    pub key: PathBuf,
+    /// Purpose to match when verifying.
+    #[arg(long, default_value = "file")]
+    pub purpose: String,
+    /// New signature file (default: FILE.sig).
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+}
+
 #[derive(Args)]
 pub struct Seal {
+    /// Encrypt to a public recipient; no unlock factors required.
+    #[arg(long, value_name = "PUBLIC_KEY", conflicts_with_all = ["with", "name", "uv", "managed", "store_access", "resume", "using", "recovery_file"])]
+    pub to: Option<PathBuf>,
     /// Plaintext file; omit or use - for stdin.
     #[arg(value_name = "FILE")]
     pub input: Option<PathBuf>,

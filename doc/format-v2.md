@@ -1,6 +1,7 @@
 # Format 2
 
 Wire format and key schedule. See [design and security](security.md) for rationale.
+Recipient encryption and signing have separate [public-key formats](public-key-formats.md).
 
 All integers are unsigned and big endian unless encoded in CBOR.
 The suite is fixed by the format version.

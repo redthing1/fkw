@@ -28,13 +28,17 @@ impl Keys {
     ) -> Result<native::Authenticator> {
         let backend = native::Backend::new(self.config);
         let selection = match (prompt.operation, options.storage) {
-            (Operation::Enroll, CredentialStorage::Managed) => backend.prepare_managed_selection(
-                native::ManagedCapability::Enrollment(policy(options.verification)),
-            )?,
-            (Operation::Retire, _) => {
-                backend.prepare_managed_selection(native::ManagedCapability::Management)?
+            (Operation::Enroll, CredentialStorage::Managed) => {
+                backend.prepare_selection(native::Capability::Managed(
+                    native::ManagedCapability::Enrollment(policy(options.verification)),
+                ))?
             }
-            _ => backend.prepare_selection(policy(options.verification))?,
+            (Operation::Retire, _) => backend.prepare_selection(native::Capability::Managed(
+                native::ManagedCapability::Management,
+            ))?,
+            _ => {
+                backend.prepare_selection(native::Capability::Prf(policy(options.verification)))?
+            }
         };
         interaction.select(prompt, selection.compatible_authenticators())?;
         Ok(selection.select()?)
@@ -56,6 +60,7 @@ impl Keys {
         interaction.touch(prompt)?;
         let result = authenticator.enroll(
             native::EnrollmentRequest {
+                purpose: native::CredentialPurpose::Protection,
                 relying_party_id: app.as_str(),
                 relying_party_name: "fkw",
                 policy: policy(options.verification),
@@ -172,8 +177,10 @@ impl Session {
         prompt: Prompt<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<()> {
-        if !prompt
-            .method
+        let crate::Target::Method { method, .. } = prompt.target else {
+            return Ok(());
+        };
+        if !method
             .key_options()
             .is_some_and(|options| options.storage == CredentialStorage::Managed)
         {
@@ -240,9 +247,11 @@ impl NativeSession {
 pub(crate) fn prompt(record: &Record, operation: Operation) -> Prompt<'_> {
     Prompt {
         operation,
-        id: record.id,
         label: &record.label,
-        method: record.method,
+        target: crate::Target::Method {
+            id: record.id,
+            method: record.method,
+        },
     }
 }
 fn pin_rejected(error: &native::Error) -> bool {

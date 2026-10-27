@@ -73,6 +73,243 @@ fn private(path: &Path) {
     let _ = path;
 }
 
+fn recipient_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    ok(path, &["recovery", "primary.key"]);
+    ok(
+        path,
+        &[
+            "recipient",
+            "create",
+            "identity.fkw",
+            "-w",
+            "recovery",
+            "-n",
+            "primary",
+            "-r",
+            "primary.key",
+        ],
+    );
+    assert!(path.join("identity.fkw.pub").exists());
+    dir
+}
+
+#[test]
+fn recipient_workflow_reuses_seal_open_and_access() {
+    let dir = recipient_fixture();
+    let path = dir.path();
+    let plain = vec![0x42; 131_073];
+    fs::write(path.join("message"), &plain).unwrap();
+    ok(path, &["seal", "message", "--to", "identity.fkw.pub"]);
+    ok(
+        path,
+        &[
+            "verify",
+            "message.fkw",
+            "--identity",
+            "identity.fkw",
+            "-r",
+            "primary.key",
+        ],
+    );
+    let opened = ok(
+        path,
+        &[
+            "open",
+            "message.fkw",
+            "--identity",
+            "identity.fkw",
+            "-r",
+            "primary.key",
+            "-c",
+        ],
+    );
+    assert_eq!(opened.stdout, plain);
+    ok(path, &["recovery", "backup.key"]);
+    ok(
+        path,
+        &[
+            "access",
+            "add",
+            "identity.fkw",
+            "-w",
+            "recovery",
+            "-n",
+            "backup",
+            "-r",
+            "primary.key",
+            "--new-recovery-file",
+            "backup.key",
+        ],
+    );
+    ok(
+        path,
+        &[
+            "recipient",
+            "public",
+            "identity.fkw",
+            "-u",
+            "backup",
+            "-r",
+            "backup.key",
+            "-o",
+            "again.pub",
+        ],
+    );
+    assert_eq!(
+        fs::read(path.join("identity.fkw.pub")).unwrap(),
+        fs::read(path.join("again.pub")).unwrap()
+    );
+    ok(
+        path,
+        &[
+            "open",
+            "message.fkw",
+            "--identity",
+            "identity.fkw",
+            "-u",
+            "backup",
+            "-r",
+            "backup.key",
+            "-o",
+            "opened",
+        ],
+    );
+    assert_eq!(fs::read(path.join("opened")).unwrap(), plain);
+    private(&path.join("opened"));
+}
+
+#[test]
+fn recipient_transport_and_failed_authentication() {
+    let dir = recipient_fixture();
+    let path = dir.path();
+    let armored = success(piped(
+        path,
+        &["seal", "--to", "identity.fkw.pub", "--armor"],
+        b"piped message",
+    ));
+    let reopened = success(piped(
+        path,
+        &[
+            "open",
+            "--identity",
+            "identity.fkw",
+            "-r",
+            "primary.key",
+            "-c",
+        ],
+        &armored.stdout,
+    ));
+    assert_eq!(reopened.stdout, b"piped message");
+    fs::write(path.join("message"), vec![0x42; 131_073]).unwrap();
+    ok(path, &["seal", "message", "--to", "identity.fkw.pub"]);
+    let mut changed = fs::read(path.join("message.fkw")).unwrap();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(path.join("corrupt.fkw"), changed).unwrap();
+    let rejected = run(
+        path,
+        &[
+            "open",
+            "corrupt.fkw",
+            "--identity",
+            "identity.fkw",
+            "-r",
+            "primary.key",
+            "-c",
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert_eq!(rejected.stdout, [] as [u8; 0]);
+    assert_eq!(
+        run(path, &["seal", "message", "--to", "again.pub", "-w", "key"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn offline_signature_workflow_and_expected_purpose() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let vectors = include_str!("../../../test-vectors/public-key-1.txt");
+    for (field, file) in [
+        ("credential", "signer"),
+        ("verification_key", "signer.pub"),
+        ("signing_message", "manifest"),
+        ("signature", "manifest.sig"),
+    ] {
+        let hex = vectors
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}=")))
+            .unwrap();
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        fs::write(path.join(file), bytes).unwrap();
+    }
+    ok(path, &["signer", "public", "signer", "-o", "exported.pub"]);
+    assert_eq!(
+        fs::read(path.join("exported.pub")).unwrap(),
+        fs::read(path.join("signer.pub")).unwrap()
+    );
+    ok(
+        path,
+        &[
+            "verify",
+            "manifest",
+            "--signature",
+            "manifest.sig",
+            "--key",
+            "signer.pub",
+            "--purpose",
+            "release",
+        ],
+    );
+    assert!(
+        !run(
+            path,
+            &[
+                "verify",
+                "manifest",
+                "--signature",
+                "manifest.sig",
+                "--key",
+                "signer.pub"
+            ]
+        )
+        .status
+        .success()
+    );
+    fs::write(path.join("manifest"), b"changed").unwrap();
+    assert!(
+        !run(
+            path,
+            &[
+                "verify",
+                "manifest",
+                "--signature",
+                "manifest.sig",
+                "--key",
+                "signer.pub",
+                "--purpose",
+                "release"
+            ]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        run(path, &["verify", "manifest", "--signature", "manifest.sig"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
 #[test]
 fn file_defaults_outputs_and_help() {
     let dir = fixture();

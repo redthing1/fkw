@@ -13,13 +13,19 @@ pub enum Error {
     InvalidInput(&'static str),
     #[error("invalid or unsupported envelope")]
     InvalidEnvelope,
+    #[error("invalid or unsupported recipient key")]
+    InvalidRecipient,
+    #[error("invalid or unsupported signing key or signature")]
+    InvalidSignature,
+    #[error("signature verification failed")]
+    VerificationFailed,
     #[error("invalid or incomplete sealed data")]
     InvalidSealedData,
-    #[error("envelope belongs to a different application")]
+    #[error("application identity does not match")]
     WrongApplication,
     #[error("method is not permitted by application policy")]
     MethodNotAllowed,
-    #[error("selected method exceeds application resource limits")]
+    #[error("operation exceeds resource limits")]
     ResourceLimit,
     #[error("KDF memory could not be allocated")]
     KdfResourceUnavailable,

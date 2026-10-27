@@ -28,7 +28,9 @@ hmac = { version = "0.13.0", features = ["zeroize"] }
 libc = "0.2.183"
 libloading = "0.8.9"
 minicbor = { version = "2.2.2", features = ["std"] }
-p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "std"] }
+p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
+hpke = { version = "0.14.0", default-features = false, features = ["alloc", "x25519", "chacha"] }
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng", "zeroize"] }
 rpassword = "7.5.4"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
 subtle = "2.6.1"

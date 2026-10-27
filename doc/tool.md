@@ -12,6 +12,8 @@ verifies the entire file before releasing plaintext. Access edits update the
 input file; `-o` writes a separate copy. Explicit destinations must be new files.
 Use `fkw COMMAND --help` for all options.
 
+For `seal` and `open`:
+
 | Option | Use |
 | --- | --- |
 | `-t`, `--text` | Enter a single hidden line; no secret argument |
@@ -20,8 +22,8 @@ Use `fkw COMMAND --help` for all options.
 | `-c`, `--stdout` | Write to stdout; `-o -` also works |
 | `--armor` | Seal as printable text; defaults to stdout without an input filename |
 
-Binary and armored files work with every reading command. Files use bounded
-memory; some operations need temporary disk space. New files are private on Unix.
+Encrypted inputs accept binary or armored data. Files use bounded memory;
+some operations need temporary disk space. New files are private on Unix.
 Original filenames and permissions are not stored.
 
 Choose protection with `-w` / `--with`, or select interactively: `key`,
@@ -33,6 +35,41 @@ Passphrases and PINs use hidden prompts. Key enrollment always requires a PIN.
 Unlocking follows the enrolled policy: touch only, or PIN + touch if enrolled
 with `--uv`. `--managed` creates a discoverable credential. Keystore methods
 accept `--store-access`; see [platform support](platform-storage.md).
+
+## Public-key encryption
+
+```sh
+fkw recipient create identity.fkw -w key+passphrase --uv
+fkw seal message.txt --to identity.fkw.pub
+fkw open message.txt.fkw --identity identity.fkw -o restored.txt
+```
+
+Creation writes the protected identity and its `.pub` file. Senders need only
+that public file, obtained through a trusted channel. Keep `identity.fkw` for
+decryption; manage its protection and recovery with the same `access` commands
+below. `verify FILE --identity identity.fkw` checks ciphertext without output.
+Use `recipient public identity.fkw -o recipient.pub` to export the public key again.
+
+## Signing
+
+```sh
+fkw signer create signer.key
+fkw sign archive.tar --key signer.key
+fkw verify archive.tar --signature archive.tar.sig --key signer.key.pub
+```
+
+Creation requires PIN and touch, and writes `signer.key` and `signer.key.pub`.
+The key file holds the credential handle; the token performs signing. Back up
+this file, and give verifiers the `.pub` file through a trusted channel.
+Verification needs no token or libfido2 installation.
+
+`sign FILE` writes `FILE.sig`. Use `-o FILE` for another destination; signing
+piped stdin requires input `-` and `-o FILE`.
+
+The signature purpose defaults to `file`. Set `--purpose NAME` on both `sign` and
+`verify` for another use. `signer public signer.key -o signer.pub` exports the
+public key again without the token. Recovery secrets cannot restore signing
+credentials on a replacement token.
 
 ## Access methods
 
@@ -55,7 +92,7 @@ numbered as needed (`key`, `key-2`, …); replacing keeps the old label.
 `-u` / `--using` selects an exact label or a unique ID prefix of at least four
 characters. A sole method is selected automatically; otherwise you choose
 interactively. `--no-input` disables terminal questions.
-`info` lists unverified metadata; `verify` authenticates the complete file.
+`info` lists a protected file's unverified methods; `verify` authenticates it.
 
 Recovery files hold 32 random bytes. Keep them separate from sealed data; Unix
 reads require private permissions. `-r` supplies the unlocking secret, or the
@@ -70,7 +107,7 @@ retirement and key rotation are library operations.
 
 ## Failed saves
 
-A save error identifies retained work and the available recovery option. Use a
+A save error reports any retained work. For encryption and access edits, use the
 completed `sealed.fkw`, or retry with its `envelope` snapshot:
 
 ```sh

@@ -1,8 +1,13 @@
 # Platform support
 
-Security-key operations dynamically load libfido2 on Linux and macOS. Other
-methods do not require it. Native keystore factors are random 32-byte values,
-scoped by trusted application identity, method ID and access policy.
+Security-key operations dynamically load libfido2 on Linux and macOS. Public-key
+encryption and signature verification do not require it. Security-key protection
+and signing require FIDO2, ES256, credential protection, and a configured client
+PIN. Protection additionally requires `hmac-secret`. Diagnostics report
+requirements for the requested operation.
+
+Native keystore factors are random 32-byte values scoped by trusted application
+identity, method ID and access policy.
 
 | Access | macOS | Linux |
 | --- | --- | --- |

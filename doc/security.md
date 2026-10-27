@@ -2,8 +2,9 @@
 
 fkw protects a random root key with one or more unlock methods. Applications can
 change those methods while keeping their derived keys and sealed payloads intact.
-[Format 2](format-v2.md) specifies the encoding and key schedule;
-[library usage](integration.md) covers the API and persistence.
+Separate FIDO2 credentials sign messages for offline verification.
+[Format 2](format-v2.md) and [public-key formats](public-key-formats.md) specify
+the encodings and key schedules; [library usage](integration.md) covers persistence.
 
 ## Recommended protection
 
@@ -23,7 +24,7 @@ An attacker may copy, modify, truncate, or replace envelopes and sealed files.
 Authentication detects tampering but cannot distinguish an older valid copy.
 
 The application, host, selected authenticator, and keystore adapter are trusted
-during use. A compromised host can capture factor outputs, keys, and plaintext.
+during use. A compromised host can capture factor outputs, unlocked roots, and plaintext.
 Labels, methods, credential metadata, and approximate payload length are public.
 Keystore guarantees depend on the [platform policy](platform-storage.md).
 
@@ -151,6 +152,59 @@ output. File operations stage plaintext privately on disk to keep memory bounded
 `open_to` verifies before writing to the caller; subsequent writer failures can
 leave partial output. Deleting temporary files is not secure erasure. Use trusted
 directories and appropriate disk protection.
+
+## Public-key recipients
+
+An unlocked root derives an X25519 identity under the fixed application-key
+purpose `fkw/recipient/v1/identity`. Senders receive only its public key.
+Encryption uses [HPKE base mode](https://www.rfc-editor.org/rfc/rfc9180.html)
+with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and the export-only AEAD identifier.
+A fresh ephemeral key establishes a fresh 32-byte stream key through the HPKE
+exporter. The shared ChaCha20-Poly1305 framing authenticates the complete
+recipient header, including the recipient fingerprint and encapsulated key.
+
+The exporter supplies the per-message key directly; a separate encrypted key
+record is unnecessary for one recipient. The fixed suite and domain labels are
+specified in [public-key formats](public-key-formats.md).
+
+Authenticate the recipient public key before encrypting: substitution would
+send the message to another recipient. Anyone with the public key can create a
+valid message, so encryption does not authenticate a sender. Recipient identity
+and approximate message length are public.
+
+Access-method changes and recovery preserve the private identity. Decryption
+derives it in host memory. When protection uses FIDO, the token gates root recovery;
+the host performs X25519. A compromised root exposes recorded messages as well
+as future messages to that identity. Rotate the root and distribute the new
+public key after exposure. This scheme does not provide forward secrecy against
+recipient-key compromise.
+
+## Hardware signatures
+
+Signing uses a separate, non-discoverable ES256 credential with credential
+protection level 3. Each operation requires user verification and presence.
+The token signs a normal FIDO2 assertion whose challenge binds the application,
+verification key, explicit purpose, and SHA-256 digest of the message.
+No `hmac-secret` extension is needed for signing.
+
+Offline verification uses the same assertion verifier as protection operations.
+It checks the RP hash, ECDSA signature, UP=UV=1, absence of backup and reserved
+flags, and the exact message challenge. The signing format permits no assertion
+extensions. The signature counter is authenticated but is not treated as a clock
+or used to reject repeated verification.
+
+Trust the public verification key independently of the signature. A purpose
+separates protocols; it does not enforce application policy. Applications must
+encode any action, audience, nonce, or expiry in the signed message and enforce
+replay and authorization rules themselves. Touch and PIN authorize a signing
+operation; the token has no trusted display of its contents. A compromised host
+can request a signature over a different message.
+
+The host never receives a plaintext signing private key. Signing requires the
+saved credential handle and the original authenticator; a handle backup cannot
+restore access on a replacement token. Revocation and spare signing keys require
+application trust updates. Attestation verification establishes a valid enrollment
+response, not the token's vendor or provenance.
 
 ## Access changes and compromise recovery
 

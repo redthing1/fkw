@@ -1,8 +1,8 @@
 # fkw
 
-A Rust library and CLI for protecting keys and sealing data with passphrases,
-security keys, system keystores, or recovery secrets. Combine factors and change
-access methods without re-encrypting payloads.
+A Rust library and CLI for protected keys, encryption, and FIDO2 signatures.
+Combine security keys, passphrases, system keystores, or recovery secrets.
+Change access methods without changing derived keys or re-encrypting payloads.
 
 ## Library
 
@@ -22,7 +22,8 @@ fn seal_note(passphrase: Vec<u8>, text: &[u8]) -> Result<Vec<u8>> {
 }
 ```
 
-Use `derive_key` for application keys or `seal` for data.
+Use `derive_key` for application keys, `seal` for protected data, `recipient` for
+public-key encryption, and `sign` for hardware signatures with offline verification.
 
 ## CLI
 

@@ -7,6 +7,9 @@ publish = false
 
 [dependencies]
 getrandom.workspace = true
+p256.workspace = true
+sha2.workspace = true
+minicbor.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 

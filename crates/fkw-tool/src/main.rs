@@ -2,6 +2,7 @@
 #![allow(clippy::unnecessary_debug_formatting)] // Escape control characters in paths and labels.
 mod args;
 mod files;
+mod public_key;
 mod terminal;
 
 use anyhow::{Context, Result, bail};
@@ -41,7 +42,7 @@ fn main() -> ExitCode {
                     Some(Error::Fido(fkw::diagnostics::FidoError::CredentialNotFound))
                 )
             }) {
-                eprintln!("Use the security key enrolled for the selected method.");
+                eprintln!("Use the security key used during enrollment.");
             }
             ExitCode::from(
                 if error
@@ -68,28 +69,15 @@ fn run(cli: Cli) -> Result<()> {
             input,
             output,
             unlock: choice,
-        } => {
-            let output = destination(output, None, false)?;
-            if let Some(path) = &output {
-                files::fresh_destination(path)?;
-            }
-            let input = files::Input::read(&input)?;
-            let envelope = seal::inspect_file(&input.path)?;
-            let method = select_method(&envelope, choice.using.as_deref(), &terminal)?;
-            if let Some(output) = output {
-                seal::open_file(&protector, &input.path, &output, method, &mut terminal)?;
-                eprintln!("Saved {output:?}");
-            } else {
-                seal::open_to(
-                    &protector,
-                    &input.path,
-                    &mut io::stdout().lock(),
-                    method,
-                    &mut terminal,
-                )?;
-            }
-            Ok(())
-        }
+            identity,
+        } => open_command(
+            &protector,
+            &mut terminal,
+            &input,
+            output,
+            choice.using.as_deref(),
+            identity.as_deref(),
+        ),
         Command::Info { input } => {
             let input = files::Input::read(&input)?;
             let envelope = seal::inspect_file(input.path)?;
@@ -109,8 +97,31 @@ fn run(cli: Cli) -> Result<()> {
         Command::Verify {
             input,
             unlock: choice,
+            identity,
+            signature,
+            key,
+            purpose,
         } => {
+            if let Some(signature) = signature {
+                return public_key::verify(
+                    &input,
+                    key.as_deref().expect("clap requires a public key"),
+                    &purpose,
+                    &signature,
+                );
+            }
             let input = files::Input::read(&input)?;
+            if let Some(identity) = identity {
+                let key = public_key::identity(
+                    &protector,
+                    &mut terminal,
+                    &identity,
+                    choice.using.as_deref(),
+                )?;
+                fkw::recipient::verify_file(&key, &input.path)?;
+                eprintln!("Verified.");
+                return Ok(());
+            }
             let envelope = seal::inspect_file(&input.path)?;
             let key = unlock(
                 &protector,
@@ -124,7 +135,51 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Access { command } => access(&protector, &mut terminal, &command),
         Command::Recovery { output } => files::recovery(&output),
+        Command::Recipient { command } => public_key::recipient(&protector, &mut terminal, command),
+        Command::Signer { command } => public_key::signer(&mut terminal, command),
+        Command::Sign(args) => public_key::sign(&mut terminal, args),
     }
+}
+
+fn open_command(
+    protector: &Protector,
+    terminal: &mut Terminal,
+    input: &Path,
+    output: args::Output,
+    using: Option<&str>,
+    identity: Option<&Path>,
+) -> Result<()> {
+    let output = destination(output, None, false)?;
+    if let Some(path) = &output {
+        files::fresh_destination(path)?;
+    }
+    let input = files::Input::read(input)?;
+    if let Some(identity) = identity {
+        let key = public_key::identity(protector, terminal, identity, using)?;
+        if let Some(output) = &output {
+            fkw::recipient::decrypt_file(&key, &input.path, output)?;
+        } else {
+            fkw::recipient::decrypt_to(&key, &input.path, &mut io::stdout().lock())?;
+        }
+    } else {
+        let envelope = seal::inspect_file(&input.path)?;
+        let method = select_method(&envelope, using, terminal)?;
+        if let Some(output) = &output {
+            seal::open_file(protector, &input.path, output, method, terminal)?;
+        } else {
+            seal::open_to(
+                protector,
+                &input.path,
+                &mut io::stdout().lock(),
+                method,
+                terminal,
+            )?;
+        }
+    }
+    if let Some(output) = output {
+        eprintln!("Saved {output:?}");
+    }
+    Ok(())
 }
 
 fn select_method(
@@ -192,6 +247,14 @@ fn seal_command(protector: &Protector, terminal: &mut Terminal, args: args::Seal
         }
         Box::new(io::stdin())
     };
+    if let Some(path) = args.to {
+        let recipient = public_key::read_recipient(&path)?;
+        return work.save(None, args.armor, |path| {
+            Ok(fkw::recipient::encrypt_reader(
+                &recipient, &mut input, path,
+            )?)
+        });
+    }
     let key = if let Some(path) = args.resume {
         unlock(
             protector,
@@ -203,7 +266,7 @@ fn seal_command(protector: &Protector, terminal: &mut Terminal, args: args::Seal
         let request = enrollment(&args.enroll, None, None, terminal)?;
         protector.create(&request, terminal)?
     };
-    work.save(key.envelope(), args.armor, |path| {
+    work.save(Some(key.envelope()), args.armor, |path| {
         Ok(seal::seal_reader(&key, &mut input, path)?)
     })
 }
@@ -336,7 +399,7 @@ fn access(protector: &Protector, terminal: &mut Terminal, command: &Access) -> R
         }
         Access::Restore { .. } => {}
     }
-    work.save(key.envelope(), input.armored, |path| {
+    work.save(Some(key.envelope()), input.armored, |path| {
         Ok(seal::update_file(&key, &input.path, path)?)
     })?;
     if matches!(command, Access::Replace { .. } | Access::Remove { .. }) {

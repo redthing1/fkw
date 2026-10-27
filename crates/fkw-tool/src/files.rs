@@ -90,11 +90,29 @@ pub fn read_envelope(path: &Path) -> Result<Envelope> {
 }
 
 pub fn fresh_destination(path: &Path) -> Result<()> {
+    if path == Path::new("-") {
+        bail!("choose an output file instead of '-'");
+    }
     match fs::symlink_metadata(path) {
         Ok(_) => bail!("destination already exists: {path:?}"),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Publish public key material or a signature, retaining completed work on failure.
+pub fn save_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut staged = NamedTempFile::new_in(parent(path))?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    if let Err(error) = staged.persist_noclobber(path) {
+        let (_, retained) = error.file.keep()?;
+        return Err(error.error)
+            .with_context(|| format!("save failed; completed output retained at {retained:?}"));
+    }
+    sync_directory(parent(path)).map_err(Error::PublicationUncertain)?;
+    eprintln!("Saved {path:?}");
+    Ok(())
 }
 fn parent(path: &Path) -> &Path {
     path.parent()
@@ -191,14 +209,16 @@ impl Work {
     }
     pub fn save(
         self,
-        envelope: &Envelope,
+        envelope: Option<&Envelope>,
         armored: bool,
         build: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<()> {
         let sealed = self.directory.path().join("sealed.fkw");
         let snapshot = self.directory.path().join("envelope");
         let result: Result<()> = (|| {
-            write_private(&snapshot, &envelope.to_bytes())?;
+            if let Some(envelope) = envelope {
+                write_private(&snapshot, &envelope.to_bytes())?;
+            }
             sync_directory(parent(self.directory.path()))?;
             build(&sealed)?;
             if let Some(destination) = &self.destination {
@@ -245,6 +265,8 @@ impl Work {
                 let retained = self.directory.keep();
                 let next = if sealed.is_file() {
                     "the complete encrypted file is sealed.fkw"
+                } else if envelope.is_none() {
+                    "encryption did not complete"
                 } else if read_envelope(&snapshot).is_ok() {
                     "retry with the envelope snapshot using seal --resume or access restore"
                 } else {
@@ -291,6 +313,24 @@ mod tests {
     use fkw::{ApplicationId, Enrollment, Method, Protector, seal};
 
     #[test]
+    fn artifact_publication_race_retains_completed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("signer.key");
+        fresh_destination(&destination).unwrap();
+        fs::write(&destination, b"another writer").unwrap();
+        let error = save_artifact(&destination, b"completed credential").unwrap_err();
+        assert!(format!("{error:#}").contains("completed output retained"));
+        assert_eq!(fs::read(&destination).unwrap(), b"another writer");
+        let retained: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &destination)
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(fs::read(&retained[0]).unwrap(), b"completed credential");
+    }
+
+    #[test]
     fn publication_race_retains_enrollment_and_complete_ciphertext() {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("output");
@@ -304,7 +344,7 @@ mod tests {
             .unwrap();
         let work = Work::new(Some(destination.clone())).unwrap();
         let retained = work.directory.path().to_owned();
-        let result = work.save(key.envelope(), false, |path| {
+        let result = work.save(Some(key.envelope()), false, |path| {
             seal::seal_reader(&key, &mut b"private text".as_slice(), path)?;
             fs::write(&destination, b"another writer")?;
             Ok(())
@@ -338,7 +378,7 @@ mod tests {
         let work = Work::edit(&destination, None).unwrap();
         let retained = work.directory.path().to_owned();
         let error = work
-            .save(key.envelope(), false, |path| {
+            .save(Some(key.envelope()), false, |path| {
                 seal::update_file(&key, &destination, path)?;
                 fs::write(&destination, b"another writer")?;
                 Ok(())
@@ -370,7 +410,7 @@ mod tests {
         let work = Work::new(Some(dir.path().join("output"))).unwrap();
         let retained = work.directory.path().to_owned();
         let error = work
-            .save(key.envelope(), false, |path| {
+            .save(Some(key.envelope()), false, |path| {
                 Ok(seal::seal_reader(&key, &mut BrokenInput, path)?)
             })
             .unwrap_err();
@@ -401,7 +441,7 @@ mod tests {
         let retained = work.directory.path().to_owned();
         fs::create_dir(retained.join("envelope")).unwrap();
         let error = work
-            .save(key.envelope(), false, |_| {
+            .save(Some(key.envelope()), false, |_| {
                 panic!("snapshot must be saved first")
             })
             .unwrap_err();

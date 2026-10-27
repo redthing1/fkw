@@ -17,6 +17,8 @@ argon2.workspace = true
 fkw-libfido2 = { path = "../fkw-libfido2" }
 getrandom.workspace = true
 hkdf.workspace = true
+hpke.workspace = true
+chacha20.workspace = true
 hmac.workspace = true
 minicbor.workspace = true
 p256.workspace = true

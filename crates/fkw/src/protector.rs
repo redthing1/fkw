@@ -105,7 +105,11 @@ impl Protector {
         self
     }
     pub fn inspect_authenticators(&self) -> Result<Vec<crate::diagnostics::DeviceReport>> {
-        Ok(fkw_libfido2::Backend::new(self.keys.config).inspect_authenticators()?)
+        Ok(
+            fkw_libfido2::Backend::new(self.keys.config).inspect_authenticators(
+                fkw_libfido2::Capability::Prf(fkw_libfido2::ExactPolicy::UserVerified),
+            )?,
+        )
     }
     /// Generates a root and enrolls its first method. Persist the returned envelope.
     /// If saving fails, retain this handle and retry the save, not enrollment.

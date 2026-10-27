@@ -1,9 +1,11 @@
-//! Small, explicit protection of application keys and sealed data.
+//! Protected application keys, encryption, and FIDO2 signatures.
 //!
 //! A [`Protector`] owns trusted policy. An [`Envelope`] contains public metadata.
 //! Unlock exactly one [`MethodId`] to obtain an [`UnlockedKey`]. Multiple methods
 //! are alternatives; combined methods require both factors. Native FIDO loading
 //! happens only when a security-key operation is selected.
+//! [`recipient`] encrypts to a public identity derived from an unlocked key.
+//! [`sign`] uses dedicated hardware credentials with offline verification.
 //!
 //! ```
 //! use fkw::{ApplicationId, Enrollment, Method, Protector, RecoverySecret, seal};
@@ -24,13 +26,17 @@
 mod crypto;
 mod envelope;
 mod error;
+mod files;
 mod id;
 mod interaction;
 mod methods;
+mod payload;
 mod platform;
 mod protector;
+pub mod recipient;
 pub mod seal;
 mod secret;
+pub mod sign;
 
 pub use envelope::{Envelope, MethodInfo};
 pub use error::{Error, Result};
@@ -39,7 +45,7 @@ pub use fkw_platform::{
     Access as StoreAccess, Keystore, NativeStore, Removal, Secret as StoreSecret, StoreError,
 };
 pub use id::{ApplicationId, MethodId};
-pub use interaction::{Interaction, Operation, PassphrasePurpose, Prompt};
+pub use interaction::{Interaction, Operation, PassphrasePurpose, Prompt, Target};
 pub use methods::{CredentialStorage, Enrollment, KdfCost, KeyOptions, Method, Verification};
 pub use protector::{Protector, UnlockedKey};
 pub use secret::{DerivedKey, Passphrase, RecoverySecret};
@@ -50,5 +56,7 @@ pub mod diagnostics {
         runtime_available,
     };
 }
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

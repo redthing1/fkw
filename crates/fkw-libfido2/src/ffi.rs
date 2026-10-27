@@ -4,7 +4,9 @@
 
 #![allow(non_camel_case_types)]
 
-use core::ffi::{c_char, c_int, c_uchar, c_void};
+#[cfg(test)]
+use core::ffi::c_void;
+use core::ffi::{c_char, c_int, c_uchar};
 use std::sync::OnceLock;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -46,6 +48,7 @@ pub struct fido_dev_info_t {
 }
 
 #[repr(C)]
+#[cfg(test)]
 pub struct es256_pk_t {
     _private: [u8; 0],
 }
@@ -90,11 +93,15 @@ pub const FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID: c_int = 0x02;
 pub const FIDO_CRED_PROT_UV_REQUIRED: c_int = 0x03;
 pub const COSE_ES256: c_int = -7;
 
+#[cfg(test)]
 pub const AUTHDATA_UP: u8 = 0x01;
+#[cfg(test)]
 pub const AUTHDATA_UV: u8 = 0x04;
 // CTAP 2.2/WebAuthn backup flags. libfido2 exposes the complete signed flags
 // byte but does not provide public constants for these two bits.
+#[cfg(test)]
 pub const AUTHDATA_BE: u8 = 0x08;
+#[cfg(test)]
 pub const AUTHDATA_BS: u8 = 0x10;
 
 static API: OnceLock<Result<Api>> = OnceLock::new();
@@ -217,8 +224,11 @@ macro_rules! fido_api {
 fido_api! {
     fn fido_init(flags: c_int);
 
+    #[cfg(test)]
     fn es256_pk_new() -> *mut es256_pk_t;
+    #[cfg(test)]
     fn es256_pk_free(public_key: *mut *mut es256_pk_t);
+    #[cfg(test)]
     fn es256_pk_from_ptr(
         public_key: *mut es256_pk_t,
         bytes: *const c_void,
@@ -359,15 +369,22 @@ fido_api! {
         pin: *const c_char,
     ) -> c_int;
     fn fido_assert_count(assertion: *const fido_assert_t) -> usize;
+    fn fido_assert_authdata_raw_ptr(assertion: *const fido_assert_t, index: usize) -> *const c_uchar;
+    fn fido_assert_authdata_raw_len(assertion: *const fido_assert_t, index: usize) -> usize;
+    fn fido_assert_sig_ptr(assertion: *const fido_assert_t, index: usize) -> *const c_uchar;
+    fn fido_assert_sig_len(assertion: *const fido_assert_t, index: usize) -> usize;
+    fn fido_assert_rp_id(assertion: *const fido_assert_t) -> *const c_char;
+    fn fido_assert_clientdata_hash_ptr(assertion: *const fido_assert_t) -> *const c_uchar;
+    fn fido_assert_clientdata_hash_len(assertion: *const fido_assert_t) -> usize;
     fn fido_assert_id_ptr(assertion: *const fido_assert_t, index: usize) -> *const c_uchar;
     fn fido_assert_id_len(assertion: *const fido_assert_t, index: usize) -> usize;
+    #[cfg(test)]
     fn fido_assert_verify(
         assertion: *const fido_assert_t,
         index: usize,
         cose: c_int,
         public_key: *const c_void,
     ) -> c_int;
-    fn fido_assert_flags(assertion: *const fido_assert_t, index: usize) -> u8;
     fn fido_assert_hmac_secret_ptr(
         assertion: *const fido_assert_t,
         index: usize,

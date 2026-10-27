@@ -180,7 +180,7 @@ fn validate_milliseconds(duration: Duration, message: &'static str) -> Result<()
     Ok(())
 }
 
-/// read-only authenticator capabilities used by the wrapping protocol.
+/// Read-only authenticator capabilities used for selection and diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Capabilities {
@@ -195,59 +195,65 @@ pub struct Capabilities {
     pub always_uv: bool,
 }
 
+/// The exact native operation for capability selection and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    Prf(ExactPolicy),
+    Signing,
+    Managed(ManagedCapability),
+}
+
 impl Capabilities {
-    /// whether this device satisfies the backend's common credential requirements.
     #[must_use]
-    pub fn compatible(&self) -> bool {
-        self.fido2
-            && self.hmac_secret
-            && self.credential_protection
-            && self.es256
-            && self.client_pin_supported
-            && self.client_pin_configured
+    pub fn supports(&self, operation: Capability) -> bool {
+        self.incompatibilities(operation).is_empty()
     }
 
-    /// whether exact presence-only recipients are possible on this device.
     #[must_use]
-    pub fn supports_presence_policy(&self) -> bool {
-        self.compatible() && !self.always_uv
-    }
-
-    /// whether pin-backed user-verified recipients are possible on this device.
-    #[must_use]
-    pub fn supports_verified_policy(&self) -> bool {
-        self.compatible()
-    }
-
-    /// whether the device satisfies one managed-credential operation.
-    #[must_use]
-    pub fn supports_managed(&self, capability: ManagedCapability) -> bool {
-        let management = self.fido2
-            && self.es256
-            && self.client_pin_supported
-            && self.client_pin_configured
-            && self.credential_management;
-        match capability {
-            ManagedCapability::Enrollment(policy) => {
-                management
-                    && self.hmac_secret
-                    && self.credential_protection
-                    && self.discoverable_credentials
-                    && self.supports_policy(policy)
+    pub fn incompatibilities(&self, operation: Capability) -> Vec<Incompatibility> {
+        let mut reasons = Vec::new();
+        if !self.fido2 {
+            reasons.push(Incompatibility::NotFido2);
+        }
+        if !self.es256 {
+            reasons.push(Incompatibility::MissingEs256);
+        }
+        if !self.client_pin_supported {
+            reasons.push(Incompatibility::MissingClientPin);
+        } else if !self.client_pin_configured {
+            reasons.push(Incompatibility::ClientPinNotConfigured);
+        }
+        if operation != Capability::Managed(ManagedCapability::Management) {
+            if !self.credential_protection {
+                reasons.push(Incompatibility::MissingCredentialProtection);
             }
-            ManagedCapability::Management => management,
+            if operation != Capability::Signing && !self.hmac_secret {
+                reasons.push(Incompatibility::MissingHmacSecret);
+            }
         }
-    }
-
-    fn supports_policy(&self, policy: ExactPolicy) -> bool {
-        match policy {
-            ExactPolicy::Presence => self.supports_presence_policy(),
-            ExactPolicy::UserVerified => self.supports_verified_policy(),
+        if matches!(
+            operation,
+            Capability::Prf(ExactPolicy::Presence)
+                | Capability::Managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+        ) && self.always_uv
+        {
+            reasons.push(Incompatibility::AlwaysUserVerified);
         }
+        if matches!(operation, Capability::Managed(_)) && !self.credential_management {
+            reasons.push(Incompatibility::MissingCredentialManagement);
+        }
+        if matches!(
+            operation,
+            Capability::Managed(ManagedCapability::Enrollment(_))
+        ) && !self.discoverable_credentials
+        {
+            reasons.push(Incompatibility::MissingDiscoverableCredentials);
+        }
+        reasons
     }
 }
 
-/// a reason a discovered device cannot implement the wrapping protocol.
+/// A reason a discovered device cannot perform the requested operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Incompatibility {
     NotFido2,
@@ -256,6 +262,9 @@ pub enum Incompatibility {
     MissingEs256,
     MissingClientPin,
     ClientPinNotConfigured,
+    AlwaysUserVerified,
+    MissingCredentialManagement,
+    MissingDiscoverableCredentials,
 }
 
 /// read-only inspection result for one discovered device.
@@ -278,10 +287,18 @@ pub struct DeviceReport {
 /// parameters for dedicated credential enrollment.
 #[derive(Clone, Copy)]
 pub struct EnrollmentRequest<'a> {
+    pub purpose: CredentialPurpose,
     pub relying_party_id: &'a str,
     pub relying_party_name: &'a str,
     pub policy: ExactPolicy,
     pub storage: CredentialStorage<'a>,
+}
+
+/// Credential extension profile. Signing uses required UV and non-discoverable storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialPurpose {
+    Protection,
+    Signing,
 }
 
 /// where an enrolled credential is maintained.
@@ -392,6 +409,15 @@ pub struct PrfRequest<'a> {
     pub policy: ExactPolicy,
 }
 
+/// An application-bound challenge for hardware signing.
+#[derive(Clone, Copy)]
+pub struct SignRequest<'a> {
+    pub relying_party_id: &'a str,
+    pub credential_id: &'a [u8],
+    pub es256_public_key: &'a [u8; ES256_PUBLIC_KEY_BYTES],
+    pub client_data_hash: &'a [u8; 32],
+}
+
 /// the complete identity of one managed discoverable credential.
 #[derive(Clone, Copy)]
 pub struct ManagedCredential<'a> {
@@ -489,7 +515,7 @@ impl Backend {
     ///
     /// returns an allocation or sanitized native discovery error. errors for
     /// individual devices are retained in [`DeviceStatus::Unavailable`].
-    pub fn inspect_authenticators(&self) -> Result<Vec<DeviceReport>> {
+    pub fn inspect_authenticators(&self, operation: Capability) -> Result<Vec<DeviceReport>> {
         initialize_thread()?;
         let candidates = manifest(self.config.max_devices)?;
         if candidates.is_empty() {
@@ -501,7 +527,7 @@ impl Backend {
             .map(|candidate| {
                 let status = match RawDevice::open(&candidate, self.config) {
                     Ok(mut device) => match device.capabilities() {
-                        Ok(capabilities) => status_for_capabilities(capabilities),
+                        Ok(capabilities) => status_for_capabilities(capabilities, operation),
                         Err(error) => DeviceStatus::Unavailable(error),
                     },
                     Err(error) => DeviceStatus::Unavailable(error),
@@ -511,28 +537,16 @@ impl Backend {
             .collect())
     }
 
-    /// opens and inspects candidates satisfying one exact assertion policy.
+    /// Opens and inspects candidates satisfying the requested operation's requirements.
     ///
     /// the returned set remains open so the caller can describe the exact
     /// selection ceremony before starting it.
     ///
     /// # Errors
     ///
-    /// returns a discovery, exact-policy compatibility, or transport error.
-    pub fn prepare_selection(&self, policy: ExactPolicy) -> Result<PreparedSelection> {
-        self.prepare_selection_matching(|capabilities| capabilities.supports_policy(policy))
-    }
-
-    /// opens only devices satisfying one managed-credential operation.
-    ///
-    /// # Errors
-    ///
-    /// returns a discovery, managed-compatibility, or transport error.
-    pub fn prepare_managed_selection(
-        &self,
-        capability: ManagedCapability,
-    ) -> Result<PreparedSelection> {
-        self.prepare_selection_matching(|capabilities| capabilities.supports_managed(capability))
+    /// returns a discovery, compatibility, or transport error.
+    pub fn prepare_selection(&self, operation: Capability) -> Result<PreparedSelection> {
+        self.prepare_selection_matching(|capabilities| capabilities.supports(operation))
     }
 
     fn prepare_selection_matching(
@@ -587,7 +601,7 @@ fn no_candidate_error(first_unavailable: Option<Error>, found_incompatible: bool
     })
 }
 
-/// open exact-policy candidates prepared for one selection ceremony.
+/// Compatible open candidates prepared for one selection ceremony.
 ///
 /// the candidate count and the consuming [`PreparedSelection::select`] call
 /// refer to the same native device handles.
@@ -597,7 +611,7 @@ pub struct PreparedSelection {
 }
 
 impl PreparedSelection {
-    /// returns the number of exact-policy candidates in this ceremony.
+    /// Returns the number of compatible candidates in this ceremony.
     #[must_use]
     pub fn compatible_authenticators(&self) -> usize {
         self.devices.len()
@@ -658,9 +672,9 @@ impl Authenticator {
         &self.capabilities
     }
 
-    /// enrolls a non-backup es256 credential and verifies packed attestation.
-    /// the high-level caller must immediately evaluate its final
-    /// transcript-derived PRF salt before persisting the recipient.
+    /// Enrolls an ES256 credential, rejects backup flags, and verifies packed attestation.
+    /// For protection credentials, evaluate the final transcript-derived PRF salt
+    /// before persisting the protected key.
     ///
     /// # Errors
     ///
@@ -743,11 +757,22 @@ impl Authenticator {
         if managed
             && !self
                 .capabilities
-                .supports_managed(ManagedCapability::Enrollment(request.policy))
+                .supports(Capability::Managed(ManagedCapability::Enrollment(
+                    request.policy,
+                )))
         {
             return Err(Error::CredentialManagementUnsupported);
         }
-        if !self.capabilities.supports_policy(request.policy) {
+        let capability = match request.purpose {
+            CredentialPurpose::Protection => Capability::Prf(request.policy),
+            CredentialPurpose::Signing => {
+                if managed || request.policy != ExactPolicy::UserVerified {
+                    return Err(Error::Unsupported);
+                }
+                Capability::Signing
+            }
+        };
+        if !self.capabilities.supports(capability) {
             return Err(Error::Unsupported);
         }
         Ok(managed)
@@ -766,12 +791,49 @@ impl Authenticator {
         request: PrfRequest<'_>,
         pin: Option<&Pin>,
     ) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
+        if !self.capabilities.supports(Capability::Prf(request.policy)) {
+            return Err(Error::Unsupported);
+        }
+        let hash = random_array()?;
+        let assertion = self.request_assertion(
+            SignRequest {
+                relying_party_id: request.relying_party_id,
+                credential_id: request.credential_id,
+                es256_public_key: request.es256_public_key,
+                client_data_hash: &hash,
+            },
+            request.policy,
+            Some(request.salt),
+            pin,
+        )?;
+        assertion.secret()
+    }
+
+    /// Signs an application challenge with required user verification.
+    ///
+    /// # Errors
+    /// Returns a capability, PIN, transport, or assertion verification error.
+    pub fn sign(&mut self, request: SignRequest<'_>, pin: &Pin) -> Result<crate::AssertionProof> {
+        if !self.capabilities.supports(Capability::Signing) {
+            return Err(Error::Unsupported);
+        }
+        self.request_assertion(request, ExactPolicy::UserVerified, None, Some(pin))?
+            .proof()
+    }
+
+    fn request_assertion(
+        &mut self,
+        request: SignRequest<'_>,
+        policy: ExactPolicy,
+        salt: Option<&[u8; 32]>,
+        pin: Option<&Pin>,
+    ) -> Result<Assertion> {
         validate_rp_id(request.relying_party_id)?;
         if request.credential_id.is_empty() || request.credential_id.len() > MAX_CREDENTIAL_ID_BYTES
         {
             return Err(Error::InvalidInput("credential ID length is invalid"));
         }
-        match (request.policy, pin) {
+        match (policy, pin) {
             (ExactPolicy::Presence, None) | (ExactPolicy::UserVerified, Some(_)) => {}
             (ExactPolicy::Presence, Some(_)) => {
                 return Err(Error::InvalidInput(
@@ -780,7 +842,7 @@ impl Authenticator {
             }
             (ExactPolicy::UserVerified, None) => return Err(Error::PinRequired),
         }
-        if request.policy == ExactPolicy::Presence && self.capabilities.always_uv {
+        if policy == ExactPolicy::Presence && self.capabilities.always_uv {
             return Err(Error::Unsupported);
         }
 
@@ -788,7 +850,6 @@ impl Authenticator {
             request.relying_party_id,
             "relying-party ID contains a NUL byte",
         )?;
-        let client_data_hash = Zeroizing::new(random_array()?);
         let mut assertion = Assertion::new()?;
         assertion.call("set relying party", |raw| unsafe {
             ffi::fido_assert_set_rp(raw, rp_id.as_ptr())
@@ -796,8 +857,8 @@ impl Authenticator {
         assertion.call("set client-data hash", |raw| unsafe {
             ffi::fido_assert_set_clientdata_hash(
                 raw,
-                client_data_hash.as_ptr(),
-                client_data_hash.len(),
+                request.client_data_hash.as_ptr(),
+                request.client_data_hash.len(),
             )
         })?;
         assertion.call("set allowed credential", |raw| unsafe {
@@ -807,19 +868,21 @@ impl Authenticator {
                 request.credential_id.len(),
             )
         })?;
-        assertion.call("set hmac-secret extension", |raw| unsafe {
-            ffi::fido_assert_set_extensions(raw, ffi::FIDO_EXT_HMAC_SECRET)
-        })?;
-        assertion.call("set hmac-secret salt", |raw| unsafe {
-            ffi::fido_assert_set_hmac_salt(raw, request.salt.as_ptr(), request.salt.len())
-        })?;
+        if let Some(salt) = salt {
+            assertion.call("set hmac-secret extension", |raw| unsafe {
+                ffi::fido_assert_set_extensions(raw, ffi::FIDO_EXT_HMAC_SECRET)
+            })?;
+            assertion.call("set hmac-secret salt", |raw| unsafe {
+                ffi::fido_assert_set_hmac_salt(raw, salt.as_ptr(), salt.len())
+            })?;
+        }
         assertion.call("require user presence", |raw| unsafe {
             ffi::fido_assert_set_up(raw, ffi::FIDO_OPT_TRUE)
         })?;
         assertion.call("set exact user verification", |raw| unsafe {
             ffi::fido_assert_set_uv(
                 raw,
-                match request.policy {
+                match policy {
                     ExactPolicy::Presence => ffi::FIDO_OPT_FALSE,
                     ExactPolicy::UserVerified => ffi::FIDO_OPT_TRUE,
                 },
@@ -833,13 +896,8 @@ impl Authenticator {
         if result != ffi::FIDO_OK {
             return Err(self.device.translate(result, "get assertion"));
         }
-        drop(client_data_hash);
-
-        assertion.verified_secret(
-            request.credential_id,
-            request.es256_public_key,
-            request.policy,
-        )
+        assertion.verify_identity(request.credential_id, request.es256_public_key, policy)?;
+        Ok(assertion)
     }
 
     /// proves control of the exact managed credential, then confirms its
@@ -983,7 +1041,7 @@ impl Authenticator {
     fn validate_managed(&self, credential: InventoryExpectation<'_>) -> Result<()> {
         if !self
             .capabilities
-            .supports_managed(ManagedCapability::Management)
+            .supports(Capability::Managed(ManagedCapability::Management))
         {
             return Err(Error::CredentialManagementUnsupported);
         }
@@ -1389,8 +1447,8 @@ unsafe fn option_value(info: *const ffi::fido_cbor_info_t, wanted: &str) -> Resu
     Ok(None)
 }
 
-fn status_for_capabilities(capabilities: Capabilities) -> DeviceStatus {
-    let reasons = incompatibilities(&capabilities);
+fn status_for_capabilities(capabilities: Capabilities, operation: Capability) -> DeviceStatus {
+    let reasons = capabilities.incompatibilities(operation);
     if reasons.is_empty() {
         DeviceStatus::Compatible(capabilities)
     } else {
@@ -1399,28 +1457,6 @@ fn status_for_capabilities(capabilities: Capabilities) -> DeviceStatus {
             reasons,
         }
     }
-}
-
-fn incompatibilities(capabilities: &Capabilities) -> Vec<Incompatibility> {
-    let mut reasons = Vec::new();
-    if !capabilities.fido2 {
-        reasons.push(Incompatibility::NotFido2);
-    }
-    if !capabilities.hmac_secret {
-        reasons.push(Incompatibility::MissingHmacSecret);
-    }
-    if !capabilities.credential_protection {
-        reasons.push(Incompatibility::MissingCredentialProtection);
-    }
-    if !capabilities.es256 {
-        reasons.push(Incompatibility::MissingEs256);
-    }
-    if !capabilities.client_pin_supported {
-        reasons.push(Incompatibility::MissingClientPin);
-    } else if !capabilities.client_pin_configured {
-        reasons.push(Incompatibility::ClientPinNotConfigured);
-    }
-    reasons
 }
 
 fn select_by_touch(
@@ -1705,7 +1741,12 @@ impl Credential {
         credential.call("set extensions", |raw| unsafe {
             ffi::fido_cred_set_extensions(
                 raw,
-                ffi::FIDO_EXT_HMAC_SECRET | ffi::FIDO_EXT_CRED_PROTECT,
+                ffi::FIDO_EXT_CRED_PROTECT
+                    | if request.purpose == CredentialPurpose::Protection {
+                        ffi::FIDO_EXT_HMAC_SECRET
+                    } else {
+                        0
+                    },
             )
         })?;
         credential.call("set credential protection", |raw| unsafe {
@@ -1848,8 +1889,10 @@ impl Drop for Credential {
 
 struct Assertion(NonNull<ffi::fido_assert_t>);
 
+#[cfg(test)]
 struct Es256PublicKey(NonNull<ffi::es256_pk_t>);
 
+#[cfg(test)]
 impl Es256PublicKey {
     fn from_bytes(bytes: &[u8; ES256_PUBLIC_KEY_BYTES]) -> Result<Self> {
         let public_key =
@@ -1868,6 +1911,7 @@ impl Es256PublicKey {
     }
 }
 
+#[cfg(test)]
 impl Drop for Es256PublicKey {
     fn drop(&mut self) {
         let mut raw = self.0.as_ptr();
@@ -1899,18 +1943,30 @@ impl Assertion {
         }
     }
 
-    fn verified_secret(
-        &self,
-        expected_id: &[u8],
-        public_key: &[u8; ES256_PUBLIC_KEY_BYTES],
-        policy: ExactPolicy,
-    ) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
-        self.verify_identity(expected_id, public_key, policy)?;
+    fn proof(&self) -> Result<crate::AssertionProof> {
+        let raw = self.0.as_ptr();
+        if unsafe { ffi::fido_assert_count(raw) } != 1 {
+            return Err(Error::VerificationFailed);
+        }
+        let data = copy_native_bytes(
+            unsafe { ffi::fido_assert_authdata_raw_ptr(raw, 0) },
+            unsafe { ffi::fido_assert_authdata_raw_len(raw, 0) },
+            4096,
+        )?;
+        let signature = copy_native_bytes(
+            unsafe { ffi::fido_assert_sig_ptr(raw, 0) },
+            unsafe { ffi::fido_assert_sig_len(raw, 0) },
+            72,
+        )?;
+        crate::AssertionProof::from_parts(&data, &signature)
+    }
 
+    // Called only after request_assertion has verified the assertion.
+    fn secret(&self) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
         let raw = self.0.as_ptr();
         // libfido2 parses the encrypted hmac-secret result from this assertion's
         // raw authenticator data and decrypts it into the same assertion
-        // statement. verify_identity above authenticates that raw data. Do not
+        // statement. verify_identity authenticates that raw data. Do not
         // fetch or copy the decrypted result before every identity check.
         let secret_len = unsafe { ffi::fido_assert_hmac_secret_len(raw, 0) };
         let secret_pointer = unsafe { ffi::fido_assert_hmac_secret_ptr(raw, 0) };
@@ -1933,20 +1989,20 @@ impl Assertion {
             return Err(Error::VerificationFailed);
         }
 
-        let public_key = Es256PublicKey::from_bytes(public_key)?;
-        let verify_status =
-            unsafe { ffi::fido_assert_verify(raw, 0, ffi::COSE_ES256, public_key.as_ptr().cast()) };
-        if verify_status != ffi::FIDO_OK {
+        let rp = unsafe { ffi::fido_assert_rp_id(raw) };
+        if rp.is_null() {
             return Err(Error::VerificationFailed);
         }
-
-        // libfido2 verifies flags requested as true, but does not prove the
-        // absence of UV when false was requested and does not enforce the
-        // backup flags. Inspect only after the signature has verified and
-        // require the exact policy branch with BE=0 and BS=0.
-        if !flags_match(unsafe { ffi::fido_assert_flags(raw, 0) }, policy) {
-            return Err(Error::VerificationFailed);
-        }
+        let rp = unsafe { CStr::from_ptr(rp) }
+            .to_str()
+            .map_err(|_| Error::VerificationFailed)?;
+        let hash = copy_native_bytes(
+            unsafe { ffi::fido_assert_clientdata_hash_ptr(raw) },
+            unsafe { ffi::fido_assert_clientdata_hash_len(raw) },
+            32,
+        )?;
+        let hash: [u8; 32] = hash.try_into().map_err(|_| Error::VerificationFailed)?;
+        self.proof()?.verify(rp, &hash, public_key, policy)?;
         let id_len = unsafe { ffi::fido_assert_id_len(raw, 0) };
         let id_pointer = unsafe { ffi::fido_assert_id_ptr(raw, 0) };
         if id_len != expected_id.len()
@@ -1981,13 +2037,7 @@ impl Drop for Assertion {
     }
 }
 
-fn flags_match(flags: u8, policy: ExactPolicy) -> bool {
-    let up = flags & ffi::AUTHDATA_UP != 0;
-    let uv = flags & ffi::AUTHDATA_UV != 0;
-    let backup_eligible = flags & ffi::AUTHDATA_BE != 0;
-    let backup_state = flags & ffi::AUTHDATA_BS != 0;
-    up && uv == (policy == ExactPolicy::UserVerified) && !backup_eligible && !backup_state
-}
+use crate::assertion::flags_match;
 
 fn translate_status(status: i32, operation: &'static str) -> Error {
     match status {
@@ -2193,6 +2243,36 @@ mod tests {
     }
 
     #[test]
+    fn independent_assertion_proof_authenticates_extensions() {
+        let proof = crate::AssertionProof::from_parts(
+            &SIGNED_EXTENSION_AUTHDATA,
+            &SIGNED_EXTENSION_SIGNATURE,
+        )
+        .unwrap();
+        proof
+            .verify(
+                "fixture.example",
+                &SIGNED_EXTENSION_CLIENT_DATA_HASH,
+                &SIGNED_EXTENSION_PUBLIC_KEY,
+                ExactPolicy::Presence,
+            )
+            .unwrap();
+        let mut altered = SIGNED_EXTENSION_AUTHDATA;
+        *altered.last_mut().unwrap() ^= 1;
+        assert!(
+            crate::AssertionProof::from_parts(&altered, &SIGNED_EXTENSION_SIGNATURE)
+                .unwrap()
+                .verify(
+                    "fixture.example",
+                    &SIGNED_EXTENSION_CLIENT_DATA_HASH,
+                    &SIGNED_EXTENSION_PUBLIC_KEY,
+                    ExactPolicy::Presence,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     #[ignore = "requires a compatible libfido2 runtime"]
     fn hmac_secret_extension_bytes_are_covered_by_the_assertion_signature() {
         initialize_thread().unwrap();
@@ -2201,6 +2281,17 @@ mod tests {
             &SIGNED_EXTENSION_AUTHDATA,
             &SIGNED_EXTENSION_CLIENT_DATA_HASH,
         );
+        let proof = assertion.proof().unwrap();
+        assert_eq!(proof.authenticator_data(), SIGNED_EXTENSION_AUTHDATA);
+        assert_eq!(proof.signature(), SIGNED_EXTENSION_SIGNATURE);
+        proof
+            .verify(
+                "fixture.example",
+                &SIGNED_EXTENSION_CLIENT_DATA_HASH,
+                &SIGNED_EXTENSION_PUBLIC_KEY,
+                ExactPolicy::Presence,
+            )
+            .unwrap();
         assert_eq!(
             unsafe {
                 ffi::fido_assert_verify(
@@ -2318,88 +2409,126 @@ mod tests {
             client_pin_configured: true,
             always_uv: false,
         };
-        assert!(capabilities.compatible());
-        assert!(capabilities.supports_presence_policy());
-        assert!(capabilities.supports_policy(ExactPolicy::Presence));
-        assert!(capabilities.supports_policy(ExactPolicy::UserVerified));
+        assert!(capabilities.supports(Capability::Prf(ExactPolicy::UserVerified)));
+        assert!(capabilities.supports(Capability::Prf(ExactPolicy::Presence)));
         assert!(
-            capabilities.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+            capabilities.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::Presence
+            )))
         );
         assert!(
-            capabilities.supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+            capabilities.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::UserVerified
+            )))
         );
-        assert!(capabilities.supports_managed(ManagedCapability::Management));
+        assert!(capabilities.supports(Capability::Managed(ManagedCapability::Management)));
 
         let mut always_uv = capabilities.clone();
         always_uv.always_uv = true;
-        assert!(!always_uv.supports_policy(ExactPolicy::Presence));
-        assert!(always_uv.supports_policy(ExactPolicy::UserVerified));
-        assert!(!always_uv.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence)));
+        assert!(!always_uv.supports(Capability::Prf(ExactPolicy::Presence)));
+        assert!(always_uv.supports(Capability::Prf(ExactPolicy::UserVerified)));
         assert!(
-            always_uv.supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+            !always_uv.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::Presence
+            )))
         );
-
-        let candidates = [&capabilities, &always_uv];
-        assert_eq!(
-            candidates
-                .iter()
-                .filter(|candidate| candidate.supports_policy(ExactPolicy::Presence))
-                .count(),
-            1
-        );
-        assert_eq!(
-            candidates
-                .iter()
-                .filter(|candidate| candidate.supports_policy(ExactPolicy::UserVerified))
-                .count(),
-            2
+        assert!(
+            always_uv.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::UserVerified
+            )))
         );
 
         let mut missing_es256 = capabilities;
         missing_es256.es256 = false;
-        assert!(!missing_es256.compatible());
+        assert!(!missing_es256.supports(Capability::Prf(ExactPolicy::UserVerified)));
         assert!(
-            !missing_es256.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+            !missing_es256.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::Presence
+            )))
         );
         assert!(
-            !missing_es256
-                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+            !missing_es256.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::UserVerified
+            )))
         );
-        assert!(!missing_es256.supports_managed(ManagedCapability::Management));
+        assert!(!missing_es256.supports(Capability::Managed(ManagedCapability::Management)));
 
         let mut missing_rk = always_uv.clone();
         missing_rk.discoverable_credentials = false;
-        assert!(missing_rk.supports_verified_policy());
-        assert!(!missing_rk.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence)));
+        assert!(missing_rk.supports(Capability::Prf(ExactPolicy::UserVerified)));
         assert!(
-            !missing_rk.supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+            !missing_rk.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::Presence
+            )))
         );
-        assert!(missing_rk.supports_managed(ManagedCapability::Management));
+        assert!(
+            !missing_rk.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::UserVerified
+            )))
+        );
+        assert!(missing_rk.supports(Capability::Managed(ManagedCapability::Management)));
 
         let mut missing_management = always_uv;
         missing_management.credential_management = false;
-        assert!(missing_management.supports_verified_policy());
+        assert!(missing_management.supports(Capability::Prf(ExactPolicy::UserVerified)));
         assert!(
-            !missing_management
-                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+            !missing_management.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::Presence
+            )))
         );
         assert!(
-            !missing_management
-                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+            !missing_management.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::UserVerified
+            )))
         );
-        assert!(!missing_management.supports_managed(ManagedCapability::Management));
+        assert!(!missing_management.supports(Capability::Managed(ManagedCapability::Management)));
 
         let mut missing_hmac_secret = missing_rk;
         missing_hmac_secret.hmac_secret = false;
         assert!(
-            !missing_hmac_secret
-                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+            !missing_hmac_secret.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::Presence
+            )))
         );
         assert!(
-            !missing_hmac_secret
-                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+            !missing_hmac_secret.supports(Capability::Managed(ManagedCapability::Enrollment(
+                ExactPolicy::UserVerified
+            )))
         );
-        assert!(missing_hmac_secret.supports_managed(ManagedCapability::Management));
+        assert!(missing_hmac_secret.supports(Capability::Managed(ManagedCapability::Management)));
+    }
+
+    #[test]
+    fn signing_requires_uv_protection_but_no_prf_or_managed_storage() {
+        let mut capabilities = Capabilities {
+            fido2: true,
+            hmac_secret: false,
+            credential_protection: true,
+            discoverable_credentials: false,
+            credential_management: false,
+            es256: true,
+            client_pin_supported: true,
+            client_pin_configured: true,
+            always_uv: true,
+        };
+        assert!(capabilities.supports(Capability::Signing));
+        assert_eq!(
+            capabilities.incompatibilities(Capability::Prf(ExactPolicy::UserVerified)),
+            [Incompatibility::MissingHmacSecret]
+        );
+        capabilities.client_pin_configured = false;
+        assert!(!capabilities.supports(Capability::Signing));
+        assert_eq!(
+            capabilities.incompatibilities(Capability::Signing),
+            [Incompatibility::ClientPinNotConfigured]
+        );
+        capabilities.client_pin_configured = true;
+        capabilities.credential_protection = false;
+        assert!(!capabilities.supports(Capability::Signing));
+        assert_eq!(
+            capabilities.incompatibilities(Capability::Signing),
+            [Incompatibility::MissingCredentialProtection]
+        );
     }
 
     #[test]
