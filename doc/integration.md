@@ -137,3 +137,29 @@ Signing credentials are non-discoverable and cannot be individually retired or
 recovered through a protection envelope. Back up the handle and authorize a
 separate signing key if needed. Applications own key trust, revocation, replay
 prevention, and any approval or delegation rules.
+
+### Release approval example
+
+[`release_approval.rs`](../crates/fkw/examples/release_approval.rs) demonstrates
+request preparation, human review, hardware signing, and a one-use claim:
+
+```sh
+cargo run -p fkw --example release_approval -- enroll approver.key
+cargo run -p fkw --example release_approval -- approve release.tar \
+  --key approver.key --trust approver.key.pub
+```
+
+Enrollment saves a dedicated credential and its `.pub` file. The verifier's
+`--trust` key is trusted configuration, distributed independently of requests.
+The client displays a canonical request binding the deployment audience,
+environment, artifact digest, random request ID, and five-minute expiry. It signs
+those exact bytes under `release-approval/v1` after confirmation, PIN, and touch.
+The verifier accepts only its original pending request, verifies the signature
+and expiry, and atomically claims it once. It prints the accepted digest.
+
+Client and verifier run in one process; the example performs no deployment.
+A real service must protect its trust configuration and pending requests, persist
+each claim atomically with its execution job, and execute the approved digest
+with idempotent retries using the request ID. The approving host and display
+remain trusted. Hardware-free tests cover altered requests, untrusted keys,
+expiry, and concurrent replay.

@@ -28,7 +28,14 @@ thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
+clap.workspace = true
 fkw-platform = { path = "../fkw-platform", features = ["testing"] }
+rpassword.workspace = true
+
+[[example]]
+name = "release_approval"
+test = true
 
 [lints]
 workspace = true
